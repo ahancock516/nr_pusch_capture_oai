@@ -51,7 +51,7 @@ The plugin is **non-invasive**: it does not modify the receiver processing. OAI 
 
 ```
 plugins/nr_pusch_capture/
-    INSTRUCTIONS.md          # This file
+    README.md          # This file
     CMakeLists.txt           # Build configuration
     capture_config.txt       # Number of captures (edit before running)
     src/
