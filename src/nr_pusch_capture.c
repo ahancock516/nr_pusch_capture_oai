@@ -1,30 +1,30 @@
 /*
  * PUSCH IQ Dataset Capture Plugin for Sionna Research Kit
  *
- * Hooks into the OAI receiver plugin interface to capture raw PUSCH data:
- *   - Frequency-domain IQ samples (per antenna, per OFDM symbol)
- *   - Channel estimates from DMRS interpolation
- *   - Unscrambled LLR output from the default receiver
- *   - Full slot metadata (RNTI, MCS, DMRS config, PRB allocation, ...)
+ * Hooks into the OAI receiver plugin interface to capture raw PUSCH IQ:
+ *   - Frequency-domain IQ samples (per OFDM symbol, per allocated subcarrier)
+ *   - Slot metadata needed to evaluate DMRS symbol placement and comb layout
  *
- * The plugin collects exactly N slot captures (configurable via config file)
- * and writes them to a single binary dataset file for offline analysis.
+ * The plugin collects exactly N accepted slot captures (configured via config
+ * file) and writes them to a single binary dataset file for offline analysis.
+ * A capture is accepted only when the allocation window contains DMRS symbols,
+ * the active PUSCH configuration exposes a strongly visible DMRS RE comb and
+ * that comb is detected in the received IQ, and the resulting IQ payload is
+ * not a duplicate of a previously accepted capture.
  *
  * Enable with:  --loader.receiver.shlibversion _pusch_capture
- *
- * Binary format: see pusch_capture_format.h or the companion read_dataset.py
  */
 
 #define _GNU_SOURCE
 #include "openair1/PHY/TOOLS/tools_defs.h"
 #include "openair1/PHY/defs_gNB.h"
-#include "openair1/PHY/NR_REFSIG/dmrs_nr.h"
 #include "PHY/sse_intrin.h"
+#include <pthread.h>
+#include <stddef.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
-#include <pthread.h>
 #include <time.h>
 #include <stdatomic.h>
 
@@ -39,73 +39,64 @@
 /* Upper bounds for static buffers (NR maximums) */
 #define MAX_SYMBOLS_PER_SLOT    14
 #define MAX_RB_SIZE             273
-#define MAX_RE_PER_SYM          (MAX_RB_SIZE * 12)   /* 3276 */
-#define MAX_MOD_ORDER           8                     /* 256-QAM */
+#define MAX_RE_PER_SYM          (MAX_RB_SIZE * 12)
+
+#define FNV1A64_OFFSET_BASIS    UINT64_C(14695981039346656037)
+#define FNV1A64_PRIME           UINT64_C(1099511628211)
 
 /* --------------------------------------------------------------------------
  * Binary file format structures  (all little-endian, packed)
  * -------------------------------------------------------------------------- */
 
-#define PUSCH_FILE_MAGIC        0x50555343  /* "PUSC" */
-#define PUSCH_FORMAT_VERSION    1
+#define PUSCH_FILE_MAGIC        0x50555343
+#define PUSCH_FORMAT_VERSION    3
 #define FILE_HEADER_BYTES       64
 #define CAPTURE_HEADER_BYTES    128
+#define DMRS_COMB_POWER_RATIO_THRESHOLD 1.50
 
 typedef struct __attribute__((packed)) {
-    uint32_t magic;                 /*  0: 0x50555343                       */
-    uint32_t version;               /*  4: format version                   */
-    uint32_t max_captures;          /*  8: configured N                     */
-    uint32_t num_captures;          /* 12: captures written so far          */
-    uint8_t  reserved[48];          /* 16-63: pad to 64 bytes               */
+    uint32_t magic;
+    uint32_t version;
+    uint32_t max_captures;
+    uint32_t num_captures;
+    uint8_t  reserved[48];
 } pusch_file_header_t;
 
 _Static_assert(sizeof(pusch_file_header_t) == FILE_HEADER_BYTES,
                "file header must be 64 bytes");
 
 typedef struct __attribute__((packed)) {
-    /* ---- record envelope ---- */
-    uint32_t record_bytes;          /*  0: total bytes of this record       */
-    uint32_t capture_idx;           /*  4: 0-based capture index            */
-
-    /* ---- 8-byte aligned fields ---- */
-    int64_t  frame;                 /*  8: radio frame number               */
-    int64_t  timestamp_ns;          /* 16: CLOCK_MONOTONIC nanoseconds      */
-
-    /* ---- slot / UE identification ---- */
-    int32_t  slot;                  /* 24                                   */
-    uint16_t rnti;                  /* 28                                   */
-    uint8_t  qam_mod_order;         /* 30: 2=QPSK, 4=16QAM, 6=64QAM, 8=256QAM */
-    uint8_t  num_layers;            /* 31                                   */
-
-    /* ---- PUSCH resource allocation ---- */
-    int32_t  start_symbol;          /* 32                                   */
-    int32_t  num_symbols;           /* 36                                   */
-    int32_t  rb_size;               /* 40: number of allocated PRBs         */
-    int32_t  rb_start;              /* 44                                   */
-    int32_t  bwp_start;             /* 48                                   */
-
-    /* ---- DMRS configuration ---- */
-    uint32_t ul_dmrs_symb_pos;      /* 52: DMRS symbol bitmask              */
-    int32_t  scid;                  /* 56                                   */
-    int32_t  ul_dmrs_scrambling_id; /* 60                                   */
-    int32_t  data_scrambling_id;    /* 64                                   */
-
-    /* ---- PHY parameters ---- */
-    int32_t  ofdm_symbol_size;      /* 68: FFT size                         */
-    int32_t  first_carrier_offset;  /* 72                                   */
-    int32_t  nb_re_per_sym;         /* 76: NR_NB_SC_PER_RB * rb_size        */
-    int32_t  output_shift;          /* 80: log2_maxh                        */
-    uint32_t nvar;                  /* 84: noise variance estimate          */
-
-    /* ---- per-symbol valid RE counts ---- */
-    int16_t  valid_re[MAX_SYMBOLS_PER_SLOT]; /* 88: ul_valid_re_per_slot     */
-                                    /* 88 + 28 = 116                        */
-
-    /* ---- payload sizes in bytes ---- */
-    int32_t  iq_bytes;              /* 116: total IQ payload bytes          */
-    int32_t  chest_bytes;           /* 120: total channel-est payload bytes */
-    int32_t  llr_bytes;             /* 124: total LLR payload bytes         */
-} pusch_capture_header_t;           /* 128 total                            */
+    uint32_t record_bytes;
+    uint32_t capture_idx;
+    int64_t  frame;
+    int64_t  timestamp_ns;
+    int32_t  slot;
+    uint16_t rnti;
+    uint8_t  qam_mod_order;
+    uint8_t  num_layers;
+    int32_t  start_symbol;
+    int32_t  num_symbols;
+    int32_t  rb_size;
+    int32_t  rb_start;
+    int32_t  bwp_start;
+    uint32_t ul_dmrs_symb_pos;
+    int32_t  scid;
+    int32_t  ul_dmrs_scrambling_id;
+    int32_t  data_scrambling_id;
+    uint8_t  transform_precoding;
+    uint8_t  dmrs_config_type;
+    uint8_t  num_dmrs_cdm_grps_no_data;
+    uint8_t  reserved0;
+    uint16_t dmrs_ports;
+    uint16_t reserved1;
+    int32_t  ofdm_symbol_size;
+    int32_t  first_carrier_offset;
+    int32_t  nb_re_per_sym;
+    int32_t  output_shift;
+    uint32_t nvar;
+    int16_t  valid_re[MAX_SYMBOLS_PER_SLOT];
+    int32_t  iq_bytes;
+} pusch_capture_header_t;
 
 _Static_assert(sizeof(pusch_capture_header_t) == CAPTURE_HEADER_BYTES,
                "capture header must be 128 bytes");
@@ -114,17 +105,17 @@ _Static_assert(sizeof(pusch_capture_header_t) == CAPTURE_HEADER_BYTES,
  * Plugin state
  * -------------------------------------------------------------------------- */
 
-static FILE          *g_outfile;
-static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
-static uint32_t       g_max_captures = DEFAULT_MAX_CAPTURES;
-static atomic_uint    g_capture_count = 0;
-static int            g_done = 0;  /* set once N captures reached */
-
-/* Buffers for the two-phase capture (input IQ/chest → output LLR) */
-static pusch_capture_header_t g_pending_hdr;
-static int16_t g_iq_buf  [MAX_SYMBOLS_PER_SLOT * MAX_RE_PER_SYM * 2]; /* real,imag */
-static int16_t g_chest_buf[MAX_SYMBOLS_PER_SLOT * MAX_RE_PER_SYM * 2];
-static int     g_input_captured = 0;   /* flag: input phase done, waiting for output */
+static FILE            *g_outfile;
+static pthread_mutex_t  g_lock = PTHREAD_MUTEX_INITIALIZER;
+static uint32_t         g_max_captures = DEFAULT_MAX_CAPTURES;
+static atomic_uint      g_capture_count = 0;
+static int              g_done = 0;
+static uint64_t        *g_seen_hashes;
+static uint32_t         g_seen_hash_count = 0;
+static uint32_t         g_duplicate_skip_count = 0;
+static uint32_t         g_dmrs_skip_count = 0;
+static uint32_t         g_dmrs_comb_skip_count = 0;
+static int16_t          g_iq_buf[MAX_SYMBOLS_PER_SLOT * MAX_RE_PER_SYM * 2];
 
 /* --------------------------------------------------------------------------
  * Helpers
@@ -146,8 +137,8 @@ static void write_file_header(void)
 {
     pusch_file_header_t hdr;
     memset(&hdr, 0, sizeof(hdr));
-    hdr.magic        = PUSCH_FILE_MAGIC;
-    hdr.version      = PUSCH_FORMAT_VERSION;
+    hdr.magic = PUSCH_FILE_MAGIC;
+    hdr.version = PUSCH_FORMAT_VERSION;
     hdr.max_captures = g_max_captures;
     hdr.num_captures = 0;
     fwrite(&hdr, sizeof(hdr), 1, g_outfile);
@@ -163,6 +154,236 @@ static void update_capture_count(uint32_t count)
     fflush(g_outfile);
 }
 
+static int has_dmrs_in_capture_window(uint32_t dmrs_mask,
+                                      int start_symbol,
+                                      int num_symbols)
+{
+    for (int rel = 0; rel < num_symbols; rel++) {
+        int symbol = start_symbol + rel;
+        if ((dmrs_mask >> symbol) & 0x01)
+            return 1;
+    }
+    return 0;
+}
+
+static int dmrs_type_is_supported(uint8_t dmrs_config_type)
+{
+    return dmrs_config_type == NFAPI_NR_DMRS_TYPE1
+        || dmrs_config_type == NFAPI_NR_DMRS_TYPE2;
+}
+
+static int dmrs_type_is_type1(uint8_t dmrs_config_type)
+{
+    return dmrs_config_type == NFAPI_NR_DMRS_TYPE1;
+}
+
+static int get_dmrs_port_delta(uint8_t dmrs_config_type,
+                               uint8_t dmrs_port,
+                               uint8_t *delta_out)
+{
+    static const uint8_t type1_deltas[8] = {0, 0, 1, 1, 0, 0, 1, 1};
+    static const uint8_t type2_deltas[12] = {0, 0, 2, 2, 4, 4, 0, 0, 2, 2, 4, 4};
+
+    if (dmrs_type_is_type1(dmrs_config_type)) {
+        if (dmrs_port >= 8)
+            return 0;
+        *delta_out = type1_deltas[dmrs_port];
+        return 1;
+    }
+
+    if (dmrs_config_type != NFAPI_NR_DMRS_TYPE2 || dmrs_port >= 12)
+        return 0;
+    *delta_out = type2_deltas[dmrs_port];
+    return 1;
+}
+
+static void mark_dmrs_group_bins(uint8_t dmrs_config_type,
+                                 uint8_t group_index,
+                                 uint8_t bins[NR_NB_SC_PER_RB])
+{
+    if (dmrs_type_is_type1(dmrs_config_type)) {
+        for (int k = group_index; k < NR_NB_SC_PER_RB; k += 2)
+            bins[k] = 1;
+        return;
+    }
+
+    static const uint8_t type2_group_bins[3][4] = {
+        {0, 1, 6, 7},
+        {2, 3, 8, 9},
+        {4, 5, 10, 11},
+    };
+
+    if (group_index >= 3)
+        return;
+    for (int i = 0; i < 4; i++)
+        bins[type2_group_bins[group_index][i]] = 1;
+}
+
+static void mark_dmrs_active_bins(uint8_t dmrs_config_type,
+                                  uint8_t delta,
+                                  uint8_t bins[NR_NB_SC_PER_RB])
+{
+    if (dmrs_type_is_type1(dmrs_config_type)) {
+        for (int k = delta; k < NR_NB_SC_PER_RB; k += 2)
+            bins[k] = 1;
+        return;
+    }
+
+    static const uint8_t type2_offsets[4] = {0, 1, 6, 7};
+    for (int i = 0; i < 4; i++) {
+        uint8_t bin = delta + type2_offsets[i];
+        if (bin < NR_NB_SC_PER_RB)
+            bins[bin] = 1;
+    }
+}
+
+static int build_dmrs_quiet_bins(const pusch_capture_header_t *hdr,
+                                 uint8_t active_bins[NR_NB_SC_PER_RB],
+                                 uint8_t quiet_bins[NR_NB_SC_PER_RB])
+{
+    uint8_t reserved_bins[NR_NB_SC_PER_RB] = {0};
+    memset(active_bins, 0, NR_NB_SC_PER_RB);
+    memset(quiet_bins, 0, NR_NB_SC_PER_RB);
+
+    if (!dmrs_type_is_supported(hdr->dmrs_config_type))
+        return 0;
+
+    int max_groups = dmrs_type_is_type1(hdr->dmrs_config_type) ? 2 : 3;
+    if (hdr->num_dmrs_cdm_grps_no_data < 1
+        || hdr->num_dmrs_cdm_grps_no_data > max_groups)
+        return 0;
+
+    for (uint8_t group = 0; group < hdr->num_dmrs_cdm_grps_no_data; group++)
+        mark_dmrs_group_bins(hdr->dmrs_config_type, group, reserved_bins);
+
+    if (hdr->dmrs_ports == 0)
+        return 0;
+
+    int max_ports = dmrs_type_is_type1(hdr->dmrs_config_type) ? 8 : 12;
+    for (int port = 0; port < max_ports; port++) {
+        if (((uint16_t)hdr->dmrs_ports & (uint16_t)(1u << port)) == 0)
+            continue;
+        uint8_t delta = 0;
+        if (!get_dmrs_port_delta(hdr->dmrs_config_type, (uint8_t)port, &delta))
+            return 0;
+        mark_dmrs_active_bins(hdr->dmrs_config_type, delta, active_bins);
+    }
+
+    int active_count = 0;
+    int quiet_count = 0;
+    for (int bin = 0; bin < NR_NB_SC_PER_RB; bin++) {
+        if (active_bins[bin]) {
+            if (!reserved_bins[bin])
+                return 0;
+            active_count++;
+        } else if (reserved_bins[bin]) {
+            quiet_bins[bin] = 1;
+            quiet_count++;
+        }
+    }
+
+    return active_count > 0 && quiet_count > 0;
+}
+
+static int has_expected_dmrs_comb(const pusch_capture_header_t *hdr,
+                                  const int16_t *iq_buf,
+                                  const uint8_t active_bins[NR_NB_SC_PER_RB],
+                                  const uint8_t quiet_bins[NR_NB_SC_PER_RB])
+{
+    double active_power_sum = 0.0;
+    double quiet_power_sum = 0.0;
+    uint32_t active_sample_count = 0;
+    uint32_t quiet_sample_count = 0;
+
+    for (int rel_symbol = 0; rel_symbol < hdr->num_symbols; rel_symbol++) {
+        int symbol = hdr->start_symbol + rel_symbol;
+        if (((hdr->ul_dmrs_symb_pos >> symbol) & 0x01) == 0)
+            continue;
+
+        size_t symbol_offset = (size_t)rel_symbol * (size_t)hdr->nb_re_per_sym;
+        for (int re = 0; re < hdr->nb_re_per_sym; re++) {
+            size_t sample_index = (symbol_offset + (size_t)re) * 2;
+            double i = (double)iq_buf[sample_index + 0];
+            double q = (double)iq_buf[sample_index + 1];
+            double power = i * i + q * q;
+            uint8_t bin = (uint8_t)(re % NR_NB_SC_PER_RB);
+
+            if (active_bins[bin]) {
+                active_power_sum += power;
+                active_sample_count++;
+            } else if (quiet_bins[bin]) {
+                quiet_power_sum += power;
+                quiet_sample_count++;
+            }
+        }
+    }
+
+    if (active_sample_count == 0 || quiet_sample_count == 0)
+        return 0;
+
+    double active_mean = active_power_sum / (double)active_sample_count;
+    double quiet_mean = quiet_power_sum / (double)quiet_sample_count;
+    if (quiet_mean <= 0.0)
+        return active_mean > 0.0;
+
+    return active_mean >= quiet_mean * DMRS_COMB_POWER_RATIO_THRESHOLD;
+}
+
+static uint64_t fnv1a64_update(uint64_t hash, const void *data, size_t len)
+{
+    const uint8_t *bytes = (const uint8_t *)data;
+    for (size_t i = 0; i < len; i++) {
+        hash ^= bytes[i];
+        hash *= FNV1A64_PRIME;
+    }
+    return hash;
+}
+
+static uint64_t compute_capture_identity_hash(const pusch_capture_header_t *hdr,
+                                              const uint8_t *payload,
+                                              size_t payload_bytes)
+{
+    pusch_capture_header_t hash_hdr = *hdr;
+    hash_hdr.capture_idx = 0;
+    hash_hdr.frame = 0;
+    hash_hdr.timestamp_ns = 0;
+    hash_hdr.slot = 0;
+
+    uint64_t hash = FNV1A64_OFFSET_BASIS;
+    hash = fnv1a64_update(hash, &hash_hdr, sizeof(hash_hdr));
+    hash = fnv1a64_update(hash, payload, payload_bytes);
+    return hash;
+}
+
+static int capture_hash_seen(uint64_t hash)
+{
+    for (uint32_t i = 0; i < g_seen_hash_count; i++) {
+        if (g_seen_hashes[i] == hash)
+            return 1;
+    }
+    return 0;
+}
+
+static void remember_capture_hash(uint64_t hash)
+{
+    AssertFatal(g_seen_hash_count < g_max_captures,
+                "[nr_pusch_capture] hash table overflow (%u / %u)\n",
+                g_seen_hash_count, g_max_captures);
+    g_seen_hashes[g_seen_hash_count++] = hash;
+}
+
+static void maybe_log_skip(const char *reason,
+                           uint32_t skip_count,
+                           int64_t frame,
+                           int slot)
+{
+    if (skip_count <= 5 || skip_count % 100 == 0) {
+        printf("[nr_pusch_capture] Skipping %s (count=%u, frame=%ld, slot=%d)\n",
+               reason, skip_count, (long)frame, slot);
+        fflush(stdout);
+    }
+}
+
 /* --------------------------------------------------------------------------
  * Plugin lifecycle
  * -------------------------------------------------------------------------- */
@@ -170,12 +391,23 @@ static void update_capture_count(uint32_t count)
 int32_t receiver_init(void)
 {
     g_max_captures = read_max_captures(CONFIG_FILE);
-    printf("[nr_pusch_capture] Initializing — will capture %u slots\n",
+    g_seen_hash_count = 0;
+    g_duplicate_skip_count = 0;
+    g_dmrs_skip_count = 0;
+    g_dmrs_comb_skip_count = 0;
+    g_done = 0;
+    atomic_store(&g_capture_count, 0);
+
+    printf("[nr_pusch_capture] Initializing - will capture %u accepted slots\n",
            g_max_captures);
     printf("[nr_pusch_capture] Output: %s\n", OUTPUT_FILE);
     fflush(stdout);
 
     pthread_mutex_init(&g_lock, NULL);
+
+    g_seen_hashes = calloc(g_max_captures, sizeof(*g_seen_hashes));
+    AssertFatal(g_seen_hashes != NULL,
+                "[nr_pusch_capture] Cannot allocate duplicate filter state\n");
 
     g_outfile = fopen(OUTPUT_FILE, "wb");
     AssertFatal(g_outfile != NULL,
@@ -193,8 +425,10 @@ int32_t receiver_init_thread(void)
 int32_t receiver_shutdown(void)
 {
     uint32_t final_count = atomic_load(&g_capture_count);
-    printf("[nr_pusch_capture] Shutting down — captured %u / %u slots\n",
+    printf("[nr_pusch_capture] Shutting down - captured %u / %u accepted slots\n",
            final_count, g_max_captures);
+    printf("[nr_pusch_capture] Skipped %u captures without DMRS symbols, %u without a strongly visible DMRS comb, and %u duplicate captures\n",
+           g_dmrs_skip_count, g_dmrs_comb_skip_count, g_duplicate_skip_count);
     fflush(stdout);
 
     if (g_outfile) {
@@ -202,21 +436,14 @@ int32_t receiver_shutdown(void)
         fclose(g_outfile);
         g_outfile = NULL;
     }
+    free(g_seen_hashes);
+    g_seen_hashes = NULL;
     pthread_mutex_destroy(&g_lock);
     return 0;
 }
 
 /* --------------------------------------------------------------------------
  * Receiver plugin entry point
- *
- * Called TWICE per PUSCH slot by nr_ulsch_demodulation.c:
- *   1) ul_chs != NULL  →  input phase  (raw IQ + channel estimates available)
- *   2) ul_chs == NULL  →  output phase (unscrambled LLRs available)
- *
- * Return values:
- *    0  → plugin did NOT handle decoding; OAI runs default inner_rx
- *   -1  → plugin captured input; requests output callback after default rx
- *    1  → plugin fully handled decoding (not used here)
  * -------------------------------------------------------------------------- */
 
 int receiver_compute_llr(PHY_VARS_gNB *gNB,
@@ -236,8 +463,12 @@ int receiver_compute_llr(PHY_VARS_gNB *gNB,
                          int output_shift,
                          uint32_t nvar)
 {
-    /* Fast path: done collecting */
-    if (g_done)
+    (void)gNB;
+    (void)ulsch_id;
+    (void)llr;
+    (void)lengths;
+
+    if (g_done || !ul_chs)
         return 0;
 
     int nb_re_per_sym = NR_NB_SC_PER_RB * rel15_ul->rb_size;
@@ -246,152 +477,140 @@ int receiver_compute_llr(PHY_VARS_gNB *gNB,
                    % frame_parms->ofdm_symbol_size;
     int re_wrap = frame_parms->ofdm_symbol_size;
 
-    /* ==================================================================
-     * INPUT PHASE: capture raw IQ and channel estimates
-     * ================================================================== */
-    if (ul_chs) {
-        pthread_mutex_lock(&g_lock);
-
-        if (g_done) {
-            pthread_mutex_unlock(&g_lock);
-            return 0;
-        }
-
-        struct timespec ts;
-        clock_gettime(CLOCK_MONOTONIC, &ts);
-
-        /* Fill capture header */
-        memset(&g_pending_hdr, 0, sizeof(g_pending_hdr));
-        g_pending_hdr.capture_idx           = atomic_load(&g_capture_count);
-        g_pending_hdr.frame                 = (int64_t)frame;
-        g_pending_hdr.timestamp_ns          = (int64_t)ts.tv_sec * 1000000000LL
-                                            + (int64_t)ts.tv_nsec;
-        g_pending_hdr.slot                  = slot;
-        g_pending_hdr.rnti                  = rel15_ul->rnti;
-        g_pending_hdr.qam_mod_order         = rel15_ul->qam_mod_order;
-        g_pending_hdr.num_layers            = rel15_ul->nrOfLayers;
-        g_pending_hdr.start_symbol          = start_symbol;
-        g_pending_hdr.num_symbols           = num_symbols;
-        g_pending_hdr.rb_size               = rel15_ul->rb_size;
-        g_pending_hdr.rb_start              = rel15_ul->rb_start;
-        g_pending_hdr.bwp_start             = rel15_ul->bwp_start;
-        g_pending_hdr.ul_dmrs_symb_pos      = rel15_ul->ul_dmrs_symb_pos;
-        g_pending_hdr.scid                  = rel15_ul->scid;
-        g_pending_hdr.ul_dmrs_scrambling_id = rel15_ul->ul_dmrs_scrambling_id;
-        g_pending_hdr.data_scrambling_id    = rel15_ul->data_scrambling_id;
-        g_pending_hdr.ofdm_symbol_size      = frame_parms->ofdm_symbol_size;
-        g_pending_hdr.first_carrier_offset  = frame_parms->first_carrier_offset;
-        g_pending_hdr.nb_re_per_sym         = nb_re_per_sym;
-        g_pending_hdr.output_shift          = output_shift;
-        g_pending_hdr.nvar                  = nvar;
-
-        /* Per-symbol valid RE counts */
-        for (int s = 0; s < MAX_SYMBOLS_PER_SLOT; s++)
-            g_pending_hdr.valid_re[s] = (s < num_symbols)
-                ? pusch_vars->ul_valid_re_per_slot[start_symbol + s] : 0;
-
-        /* Capture IQ and channel estimates per OFDM symbol */
-        int iq_off = 0;
-        for (int s = 0; s < num_symbols; s++) {
-            int symbol = start_symbol + s;
-
-            /* Resolve DMRS symbol index for channel estimate addressing */
-            int dmrs_symbol = symbol;
-            if (gNB->chest_time == 0)
-                dmrs_symbol = (rel15_ul->ul_dmrs_symb_pos >> symbol) & 0x01
-                    ? symbol
-                    : get_valid_dmrs_idx_for_channel_est(
-                          rel15_ul->ul_dmrs_symb_pos, symbol);
-            else {
-                int end_sym = rel15_ul->start_symbol_index
-                            + rel15_ul->nr_of_symbols;
-                dmrs_symbol = get_next_dmrs_symbol_in_slot(
-                    rel15_ul->ul_dmrs_symb_pos,
-                    rel15_ul->start_symbol_index, end_sym);
-            }
-
-            c16_t *rxF = (c16_t *)rxFs[0]
-                         + symbol * frame_parms->ofdm_symbol_size + soffset;
-            c16_t *ul_ch_est = (c16_t *)pusch_vars->ul_ch_estimates[0]
-                               + dmrs_symbol * frame_parms->ofdm_symbol_size;
-
-            /* Copy subcarriers (handle wrap-around at FFT edge) */
-            for (int i = 0, k = start_re; i < nb_re_per_sym;
-                 k = (k + 1 < re_wrap ? k + 1 : 0), ++i) {
-                g_iq_buf[iq_off * 2 + 0]    = rxF[k].r;
-                g_iq_buf[iq_off * 2 + 1]    = rxF[k].i;
-                g_chest_buf[iq_off * 2 + 0]  = ul_ch_est[i].r;
-                g_chest_buf[iq_off * 2 + 1]  = ul_ch_est[i].i;
-                iq_off++;
-            }
-        }
-
-        int total_iq_samples = iq_off;
-        g_pending_hdr.iq_bytes    = total_iq_samples * 2 * (int32_t)sizeof(int16_t);
-        g_pending_hdr.chest_bytes = total_iq_samples * 2 * (int32_t)sizeof(int16_t);
-        g_pending_hdr.llr_bytes   = 0;  /* filled in output phase */
-
-        g_input_captured = 1;
-
-        /* Return -1: let OAI run default rx, then call us again for LLR output */
-        return -1;
-    }
-
-    /* ==================================================================
-     * OUTPUT PHASE: capture unscrambled LLRs
-     * ================================================================== */
-    if (!g_input_captured) {
-        /* Spurious output call without a preceding input capture */
+    pthread_mutex_lock(&g_lock);
+    if (g_done) {
+        pthread_mutex_unlock(&g_lock);
         return 0;
     }
-    g_input_captured = 0;
 
-    /* Gather LLR data per symbol */
-    int total_llr_count = 0;
-    for (int s = 0; s < g_pending_hdr.num_symbols; s++) {
-        int symbol = g_pending_hdr.start_symbol + s;
-        int nb_re_pusch = pusch_vars->ul_valid_re_per_slot[symbol];
-        total_llr_count += nb_re_pusch * g_pending_hdr.qam_mod_order
-                         * g_pending_hdr.num_layers;
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+
+    pusch_capture_header_t hdr;
+    memset(&hdr, 0, sizeof(hdr));
+    hdr.capture_idx = atomic_load(&g_capture_count);
+    hdr.frame = (int64_t)frame;
+    hdr.timestamp_ns = (int64_t)ts.tv_sec * 1000000000LL + (int64_t)ts.tv_nsec;
+    hdr.slot = slot;
+    hdr.rnti = rel15_ul->rnti;
+    hdr.qam_mod_order = rel15_ul->qam_mod_order;
+    hdr.num_layers = rel15_ul->nrOfLayers;
+    hdr.start_symbol = start_symbol;
+    hdr.num_symbols = num_symbols;
+    hdr.rb_size = rel15_ul->rb_size;
+    hdr.rb_start = rel15_ul->rb_start;
+    hdr.bwp_start = rel15_ul->bwp_start;
+    hdr.ul_dmrs_symb_pos = rel15_ul->ul_dmrs_symb_pos;
+    hdr.scid = rel15_ul->scid;
+    hdr.ul_dmrs_scrambling_id = rel15_ul->ul_dmrs_scrambling_id;
+    hdr.data_scrambling_id = rel15_ul->data_scrambling_id;
+    hdr.transform_precoding = rel15_ul->transform_precoding;
+    hdr.dmrs_config_type = rel15_ul->dmrs_config_type;
+    hdr.num_dmrs_cdm_grps_no_data = rel15_ul->num_dmrs_cdm_grps_no_data;
+    hdr.dmrs_ports = rel15_ul->dmrs_ports;
+    hdr.ofdm_symbol_size = frame_parms->ofdm_symbol_size;
+    hdr.first_carrier_offset = frame_parms->first_carrier_offset;
+    hdr.nb_re_per_sym = nb_re_per_sym;
+    hdr.output_shift = output_shift;
+    hdr.nvar = nvar;
+
+    if (!has_dmrs_in_capture_window(hdr.ul_dmrs_symb_pos, start_symbol, num_symbols)) {
+        g_dmrs_skip_count++;
+        maybe_log_skip("capture without DMRS in allocation window",
+                       g_dmrs_skip_count,
+                       hdr.frame,
+                       hdr.slot);
+        pthread_mutex_unlock(&g_lock);
+        return 0;
     }
-    g_pending_hdr.llr_bytes = total_llr_count * (int32_t)sizeof(int16_t);
 
-    /* Compute total record size */
-    g_pending_hdr.record_bytes = (uint32_t)(CAPTURE_HEADER_BYTES
-                                  + g_pending_hdr.iq_bytes
-                                  + g_pending_hdr.chest_bytes
-                                  + g_pending_hdr.llr_bytes);
-
-    /* Write the complete capture record */
-    fwrite(&g_pending_hdr, CAPTURE_HEADER_BYTES, 1, g_outfile);
-    fwrite(g_iq_buf,    1, g_pending_hdr.iq_bytes,    g_outfile);
-    fwrite(g_chest_buf, 1, g_pending_hdr.chest_bytes, g_outfile);
-
-    /* Write LLR data: walk per-symbol using llr_offset */
-    for (int s = 0; s < g_pending_hdr.num_symbols; s++) {
-        int symbol = g_pending_hdr.start_symbol + s;
-        int nb_re_pusch = pusch_vars->ul_valid_re_per_slot[symbol];
-        int llr_count = nb_re_pusch * g_pending_hdr.qam_mod_order
-                      * g_pending_hdr.num_layers;
-        int16_t *llr_ptr = &llr[pusch_vars->llr_offset[symbol]
-                                * g_pending_hdr.num_layers];
-        fwrite(llr_ptr, sizeof(int16_t), llr_count, g_outfile);
+    for (int s = 0; s < MAX_SYMBOLS_PER_SLOT; s++) {
+        hdr.valid_re[s] = (s < num_symbols)
+            ? pusch_vars->ul_valid_re_per_slot[start_symbol + s] : 0;
     }
+
+    int iq_off = 0;
+    for (int s = 0; s < num_symbols; s++) {
+        int symbol = start_symbol + s;
+        c16_t *rxF = (c16_t *)rxFs[0]
+                     + symbol * frame_parms->ofdm_symbol_size + soffset;
+
+        for (int i = 0, k = start_re; i < nb_re_per_sym;
+             k = (k + 1 < re_wrap ? k + 1 : 0), ++i) {
+            g_iq_buf[iq_off * 2 + 0] = rxF[k].r;
+            g_iq_buf[iq_off * 2 + 1] = rxF[k].i;
+            iq_off++;
+        }
+    }
+
+    uint8_t dmrs_active_bins[NR_NB_SC_PER_RB];
+    uint8_t dmrs_quiet_bins[NR_NB_SC_PER_RB];
+    if (!build_dmrs_quiet_bins(&hdr, dmrs_active_bins, dmrs_quiet_bins)) {
+        g_dmrs_comb_skip_count++;
+        maybe_log_skip("capture without a supportable visible DMRS RE comb",
+                       g_dmrs_comb_skip_count,
+                       hdr.frame,
+                       hdr.slot);
+        pthread_mutex_unlock(&g_lock);
+        return 0;
+    }
+
+    if (!has_expected_dmrs_comb(&hdr, g_iq_buf, dmrs_active_bins, dmrs_quiet_bins)) {
+        g_dmrs_comb_skip_count++;
+        maybe_log_skip("capture without a strongly visible DMRS RE comb",
+                       g_dmrs_comb_skip_count,
+                       hdr.frame,
+                       hdr.slot);
+        pthread_mutex_unlock(&g_lock);
+        return 0;
+    }
+
+    hdr.iq_bytes = iq_off * 2 * (int32_t)sizeof(int16_t);
+    hdr.record_bytes = (uint32_t)(CAPTURE_HEADER_BYTES + hdr.iq_bytes);
+
+    size_t record_bytes = hdr.record_bytes;
+    uint8_t *record_buf = malloc(record_bytes);
+    AssertFatal(record_buf != NULL,
+                "[nr_pusch_capture] Cannot allocate record buffer (%zu bytes)\n",
+                record_bytes);
+
+    memcpy(record_buf, &hdr, CAPTURE_HEADER_BYTES);
+    memcpy(record_buf + CAPTURE_HEADER_BYTES, g_iq_buf, hdr.iq_bytes);
+
+    uint64_t hash = compute_capture_identity_hash(
+        &hdr,
+        record_buf + CAPTURE_HEADER_BYTES,
+        (size_t)hdr.iq_bytes);
+    if (capture_hash_seen(hash)) {
+        free(record_buf);
+        g_duplicate_skip_count++;
+        maybe_log_skip("duplicate capture payload",
+                       g_duplicate_skip_count,
+                       hdr.frame,
+                       hdr.slot);
+        pthread_mutex_unlock(&g_lock);
+        return 0;
+    }
+
+    fwrite(record_buf, 1, record_bytes, g_outfile);
     fflush(g_outfile);
+    free(record_buf);
+
+    remember_capture_hash(hash);
 
     uint32_t idx = atomic_fetch_add(&g_capture_count, 1) + 1;
     update_capture_count(idx);
 
     if (idx % 50 == 0 || idx == g_max_captures) {
-        printf("[nr_pusch_capture] Captured %u / %u slots\n",
+        printf("[nr_pusch_capture] Captured %u / %u accepted slots\n",
                idx, g_max_captures);
         fflush(stdout);
     }
 
     if (idx >= g_max_captures) {
         g_done = 1;
-        printf("[nr_pusch_capture] Dataset complete (%u captures). "
-               "Plugin now passthrough.\n", idx);
+        printf("[nr_pusch_capture] Dataset complete (%u accepted captures). Plugin now passthrough.\n",
+               idx);
         fflush(stdout);
     }
 
@@ -401,6 +620,6 @@ int receiver_compute_llr(PHY_VARS_gNB *gNB,
 
 int receiver_symbols_requested(NR_DL_FRAME_PARMS *frame_parms)
 {
-    /* Return -1 to request all symbols in the slot at once */
+    (void)frame_parms;
     return -1;
 }

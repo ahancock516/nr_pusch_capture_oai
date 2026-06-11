@@ -1,60 +1,41 @@
 #!/usr/bin/env python3
 """
-Reader for PUSCH capture binary datasets produced by nr_pusch_capture plugin.
+Reader for PUSCH capture datasets produced by nr_pusch_capture.
 
-Usage:
-    from read_dataset import PUSCHDataset
-
-    ds = PUSCHDataset("plugins/nr_pusch_capture/data/pusch_dataset.bin")
-    print(ds)                    # summary
-    cap = ds[0]                  # first capture (dict)
-    iq   = cap["iq"]             # complex64 array [num_symbols, nb_re_per_sym]
-    chest = cap["chest"]         # complex64 array [num_symbols, nb_re_per_sym]
-    llr  = cap["llr"]            # int16 array, flat
-    meta = cap["meta"]           # dict of scalar metadata fields
-
-    # Iterate all captures
-    for cap in ds:
-        ...
+Format support:
+  - v1/v2: legacy datasets that may also include channel estimates and LLRs
+  - v3:    simplified IQ-only datasets with DMRS metadata and no extra payloads
 """
 
 import struct
-import numpy as np
 from pathlib import Path
 
+import numpy as np
+
 FILE_HEADER_BYTES = 64
-CAPTURE_HEADER_BYTES = 128
+CAPTURE_HEADER_BYTES_V1 = 128
+CAPTURE_HEADER_BYTES_V2 = 136
+CAPTURE_HEADER_BYTES_V3 = 128
+CAPTURE_HEADER_BYTES = CAPTURE_HEADER_BYTES_V3
 PUSCH_FILE_MAGIC = 0x50555343
 MAX_SYMBOLS_PER_SLOT = 14
 
-# Struct format for file header (little-endian, packed)
 _FILE_HDR_FMT = "<III I 48s"
 _FILE_HDR_SIZE = struct.calcsize(_FILE_HDR_FMT)
 
-# Struct format for capture header (little-endian, packed)
-# Fields: record_bytes, capture_idx, frame(i64), timestamp_ns(i64),
-#         slot(i32), rnti(u16), qam_mod_order(u8), num_layers(u8),
-#         start_symbol, num_symbols, rb_size, rb_start, bwp_start,
-#         ul_dmrs_symb_pos(u32), scid, ul_dmrs_scrambling_id, data_scrambling_id,
-#         ofdm_symbol_size, first_carrier_offset, nb_re_per_sym,
-#         output_shift, nvar(u32),
-#         valid_re[14] (14 x i16),
-#         iq_bytes, chest_bytes, llr_bytes
-_CAP_HDR_FMT = (
-    "<"        # little-endian
-    "I I"      # record_bytes, capture_idx
-    "q q"      # frame, timestamp_ns
-    "i H B B"  # slot, rnti, qam_mod_order, num_layers
-    "i i i i i" # start_symbol, num_symbols, rb_size, rb_start, bwp_start
-    "I i i i"  # ul_dmrs_symb_pos, scid, ul_dmrs_scrambling_id, data_scrambling_id
-    "i i i"    # ofdm_symbol_size, first_carrier_offset, nb_re_per_sym
-    "i I"      # output_shift, nvar
-    f"{MAX_SYMBOLS_PER_SLOT}h" # valid_re[14]
-    "i i i"    # iq_bytes, chest_bytes, llr_bytes
+_CAP_HDR_FMT_V1 = (
+    "<"
+    "I I"
+    "q q"
+    "i H B B"
+    "i i i i i"
+    "I i i i"
+    "i i i"
+    "i I"
+    f"{MAX_SYMBOLS_PER_SLOT}h"
+    "i i i"
 )
-_CAP_HDR_SIZE = struct.calcsize(_CAP_HDR_FMT)
-
-_META_FIELDS = [
+_META_FIELDS_V1 = [
     "record_bytes", "capture_idx",
     "frame", "timestamp_ns",
     "slot", "rnti", "qam_mod_order", "num_layers",
@@ -64,26 +45,97 @@ _META_FIELDS = [
     "output_shift", "nvar",
 ]
 
+_CAP_HDR_FMT_V2 = (
+    "<"
+    "I I"
+    "q q"
+    "i H B B"
+    "i i i i i"
+    "I i i i"
+    "B B B B H H"
+    "i i i"
+    "i I"
+    f"{MAX_SYMBOLS_PER_SLOT}h"
+    "i i i"
+)
+_META_FIELDS_V2 = [
+    "record_bytes", "capture_idx",
+    "frame", "timestamp_ns",
+    "slot", "rnti", "qam_mod_order", "num_layers",
+    "start_symbol", "num_symbols", "rb_size", "rb_start", "bwp_start",
+    "ul_dmrs_symb_pos", "scid", "ul_dmrs_scrambling_id", "data_scrambling_id",
+    "transform_precoding", "dmrs_config_type", "num_dmrs_cdm_grps_no_data",
+    "reserved0", "dmrs_ports", "reserved1",
+    "ofdm_symbol_size", "first_carrier_offset", "nb_re_per_sym",
+    "output_shift", "nvar",
+]
 
-def _parse_capture_header(buf):
-    """Parse a capture header from bytes, return metadata dict."""
-    vals = struct.unpack(_CAP_HDR_FMT, buf)
+_CAP_HDR_FMT_V3 = (
+    "<"
+    "I I"
+    "q q"
+    "i H B B"
+    "i i i i i"
+    "I i i i"
+    "B B B B H H"
+    "i i i"
+    "i I"
+    f"{MAX_SYMBOLS_PER_SLOT}h"
+    "i"
+)
+_META_FIELDS_V3 = list(_META_FIELDS_V2)
 
+
+def _parse_capture_header(buf, fmt, field_names, payload_fields):
+    vals = struct.unpack(fmt, buf)
     meta = {}
     idx = 0
-    for name in _META_FIELDS:
+    for name in field_names:
         meta[name] = vals[idx]
         idx += 1
-
-    # valid_re array (14 entries)
-    meta["valid_re"] = np.array(vals[idx:idx + MAX_SYMBOLS_PER_SLOT],
-                                dtype=np.int16)
+    meta["valid_re"] = np.array(vals[idx:idx + MAX_SYMBOLS_PER_SLOT], dtype=np.int16)
     idx += MAX_SYMBOLS_PER_SLOT
-
-    meta["iq_bytes"] = vals[idx]
-    meta["chest_bytes"] = vals[idx + 1]
-    meta["llr_bytes"] = vals[idx + 2]
+    for name in payload_fields:
+        meta[name] = vals[idx]
+        idx += 1
+    meta.setdefault("iq_bytes", 0)
+    meta.setdefault("chest_bytes", 0)
+    meta.setdefault("llr_bytes", 0)
+    meta.pop("reserved0", None)
+    meta.pop("reserved1", None)
     return meta
+
+
+def _empty_complex_grid():
+    return np.empty((0, 0), dtype=np.complex64)
+
+
+def _read_complex_grid(data, offset, payload_bytes, num_symbols, nb_re_per_sym, label):
+    if payload_bytes == 0:
+        return _empty_complex_grid()
+    expected_bytes = num_symbols * nb_re_per_sym * 2 * np.dtype(np.int16).itemsize
+    if payload_bytes != expected_bytes:
+        raise ValueError(
+            f"{label} payload size mismatch: got {payload_bytes}, expected {expected_bytes}"
+        )
+    raw = np.frombuffer(
+        data,
+        dtype=np.int16,
+        count=payload_bytes // np.dtype(np.int16).itemsize,
+        offset=offset,
+    ).reshape(num_symbols, nb_re_per_sym, 2).copy()
+    return (raw[..., 0] + 1j * raw[..., 1]).astype(np.complex64)
+
+
+def _read_int16_vector(data, offset, payload_bytes):
+    if payload_bytes == 0:
+        return np.empty(0, dtype=np.int16)
+    return np.frombuffer(
+        data,
+        dtype=np.int16,
+        count=payload_bytes // np.dtype(np.int16).itemsize,
+        offset=offset,
+    ).copy()
 
 
 class PUSCHDataset:
@@ -93,27 +145,42 @@ class PUSCHDataset:
         self.path = Path(path)
         self._data = self.path.read_bytes()
 
-        # Parse file header
         hdr = struct.unpack(_FILE_HDR_FMT, self._data[:_FILE_HDR_SIZE])
         magic, version, max_captures, num_captures, _ = hdr
         if magic != PUSCH_FILE_MAGIC:
             raise ValueError(
                 f"Bad magic: 0x{magic:08X} (expected 0x{PUSCH_FILE_MAGIC:08X})"
             )
-        if version != 1:
+        if version not in (1, 2, 3):
             raise ValueError(f"Unsupported format version: {version}")
 
         self.version = version
         self.max_captures = max_captures
         self.num_captures = num_captures
+        if version == 1:
+            self.capture_header_bytes = CAPTURE_HEADER_BYTES_V1
+            self._capture_header_fmt = _CAP_HDR_FMT_V1
+            self._meta_fields = _META_FIELDS_V1
+            self._payload_fields = ("iq_bytes", "chest_bytes", "llr_bytes")
+        elif version == 2:
+            self.capture_header_bytes = CAPTURE_HEADER_BYTES_V2
+            self._capture_header_fmt = _CAP_HDR_FMT_V2
+            self._meta_fields = _META_FIELDS_V2
+            self._payload_fields = ("iq_bytes", "chest_bytes", "llr_bytes")
+        else:
+            self.capture_header_bytes = CAPTURE_HEADER_BYTES_V3
+            self._capture_header_fmt = _CAP_HDR_FMT_V3
+            self._meta_fields = _META_FIELDS_V3
+            self._payload_fields = ("iq_bytes",)
 
-        # Build index of capture offsets
         self._offsets = []
         pos = FILE_HEADER_BYTES
         for _ in range(num_captures):
-            if pos + CAPTURE_HEADER_BYTES > len(self._data):
+            if pos + self.capture_header_bytes > len(self._data):
                 break
             record_bytes = struct.unpack_from("<I", self._data, pos)[0]
+            if record_bytes < self.capture_header_bytes:
+                break
             self._offsets.append(pos)
             pos += record_bytes
         self.num_captures = len(self._offsets)
@@ -122,15 +189,16 @@ class PUSCHDataset:
         return self.num_captures
 
     def __repr__(self):
-        return (f"PUSCHDataset({self.path.name}: "
-                f"{self.num_captures}/{self.max_captures} captures)")
+        return (
+            f"PUSCHDataset({self.path.name}: "
+            f"{self.num_captures}/{self.max_captures} captures, v{self.version})"
+        )
 
     def __getitem__(self, idx):
         if idx < 0:
             idx += self.num_captures
         if idx < 0 or idx >= self.num_captures:
-            raise IndexError(f"Capture index {idx} out of range "
-                             f"[0, {self.num_captures})")
+            raise IndexError(f"Capture index {idx} out of range [0, {self.num_captures})")
         return self._read_capture(self._offsets[idx])
 
     def __iter__(self):
@@ -138,71 +206,73 @@ class PUSCHDataset:
             yield self[i]
 
     def _read_capture(self, offset):
-        """Read a single capture record at the given file offset."""
-        hdr_buf = self._data[offset:offset + CAPTURE_HEADER_BYTES]
-        meta = _parse_capture_header(hdr_buf)
+        hdr_buf = self._data[offset:offset + self.capture_header_bytes]
+        meta = _parse_capture_header(
+            hdr_buf,
+            self._capture_header_fmt,
+            self._meta_fields,
+            self._payload_fields,
+        )
+        record_end = offset + int(meta["record_bytes"])
+        if record_end > len(self._data):
+            raise ValueError(
+                f"Capture at offset {offset} exceeds file size: {record_end} > {len(self._data)}"
+            )
 
         num_symbols = meta["num_symbols"]
         nb_re_per_sym = meta["nb_re_per_sym"]
-        total_re = num_symbols * nb_re_per_sym
+        pos = offset + self.capture_header_bytes
 
-        pos = offset + CAPTURE_HEADER_BYTES
-
-        # IQ samples: int16 pairs → complex64
-        iq_raw = np.frombuffer(
-            self._data, dtype=np.int16, count=total_re * 2, offset=pos
-        ).reshape(num_symbols, nb_re_per_sym, 2).copy()
-        iq = (iq_raw[..., 0] + 1j * iq_raw[..., 1]).astype(np.complex64)
+        iq = _read_complex_grid(
+            self._data,
+            pos,
+            meta["iq_bytes"],
+            num_symbols,
+            nb_re_per_sym,
+            "IQ",
+        )
         pos += meta["iq_bytes"]
 
-        # Channel estimates: int16 pairs → complex64
-        chest_raw = np.frombuffer(
-            self._data, dtype=np.int16, count=total_re * 2, offset=pos
-        ).reshape(num_symbols, nb_re_per_sym, 2).copy()
-        chest = (chest_raw[..., 0] + 1j * chest_raw[..., 1]).astype(np.complex64)
+        chest = _read_complex_grid(
+            self._data,
+            pos,
+            meta["chest_bytes"],
+            num_symbols,
+            nb_re_per_sym,
+            "ChEst",
+        )
         pos += meta["chest_bytes"]
 
-        # LLRs: flat int16 array
-        llr_count = meta["llr_bytes"] // 2
-        llr = np.frombuffer(
-            self._data, dtype=np.int16, count=llr_count, offset=pos
-        ).copy()
-
-        return {
-            "meta": meta,
-            "iq": iq,
-            "chest": chest,
-            "llr": llr,
-        }
+        llr = _read_int16_vector(self._data, pos, meta["llr_bytes"])
+        return {"meta": meta, "iq": iq, "chest": chest, "llr": llr}
 
     def summary(self):
-        """Print a summary of all captures in the dataset."""
         print(repr(self))
-        print(f"{'idx':>5} {'frame':>8} {'slot':>4} {'RNTI':>6} "
-              f"{'mod':>4} {'PRBs':>5} {'syms':>4} {'REs':>6}")
+        print(f"{'idx':>5} {'frame':>8} {'slot':>4} {'RNTI':>6} {'mod':>4} {'PRBs':>5} {'syms':>4} {'REs':>6}")
         print("-" * 50)
         for i, cap in enumerate(self):
             m = cap["meta"]
             mod_names = {2: "QPSK", 4: "16Q", 6: "64Q", 8: "256Q"}
             mod = mod_names.get(m["qam_mod_order"], f"Q{m['qam_mod_order']}")
             total_re = m["num_symbols"] * m["nb_re_per_sym"]
-            print(f"{i:5d} {m['frame']:8d} {m['slot']:4d} {m['rnti']:6d} "
-                  f"{mod:>4s} {m['rb_size']:5d} {m['num_symbols']:4d} "
-                  f"{total_re:6d}")
+            print(
+                f"{i:5d} {m['frame']:8d} {m['slot']:4d} {m['rnti']:6d} "
+                f"{mod:>4s} {m['rb_size']:5d} {m['num_symbols']:4d} {total_re:6d}"
+            )
 
 
 if __name__ == "__main__":
     import sys
-    path = sys.argv[1] if len(sys.argv) > 1 else \
-        "plugins/nr_pusch_capture/data/pusch_dataset.bin"
+
+    path = sys.argv[1] if len(sys.argv) > 1 else "plugins/nr_pusch_capture/data/pusch_dataset.bin"
     ds = PUSCHDataset(path)
     ds.summary()
 
     if len(ds) > 0:
         cap = ds[0]
-        print(f"\nFirst capture details:")
-        print(f"  IQ shape:    {cap['iq'].shape}")
-        print(f"  ChEst shape: {cap['chest'].shape}")
-        print(f"  LLR count:   {len(cap['llr'])}")
-        print(f"  IQ range:    [{cap['iq'].real.min():.0f}, "
-              f"{cap['iq'].real.max():.0f}]")
+        print("\nFirst capture details:")
+        print(f"  IQ shape:       {cap['iq'].shape}")
+        print(f"  Legacy ChEst:   {cap['chest'].shape}")
+        print(f"  Legacy LLRs:    {len(cap['llr'])}")
+        if cap['iq'].size:
+            print(f"  IQ range:       [{cap['iq'].real.min():.0f}, {cap['iq'].real.max():.0f}]")
