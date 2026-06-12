@@ -16,6 +16,7 @@ FILE_HEADER_BYTES = 64
 CAPTURE_HEADER_BYTES_V1 = 128
 CAPTURE_HEADER_BYTES_V2 = 136
 CAPTURE_HEADER_BYTES_V3 = 128
+CAPTURE_HEADER_BYTES_V4 = 144
 CAPTURE_HEADER_BYTES = CAPTURE_HEADER_BYTES_V3
 PUSCH_FILE_MAGIC = 0x50555343
 MAX_SYMBOLS_PER_SLOT = 14
@@ -85,6 +86,9 @@ _CAP_HDR_FMT_V3 = (
 )
 _META_FIELDS_V3 = list(_META_FIELDS_V2)
 
+_CAP_HDR_FMT_V4 = _CAP_HDR_FMT_V3 + "16s"
+_META_FIELDS_V4 = list(_META_FIELDS_V3)
+
 
 def _parse_capture_header(buf, fmt, field_names, payload_fields):
     vals = struct.unpack(fmt, buf)
@@ -103,6 +107,9 @@ def _parse_capture_header(buf, fmt, field_names, payload_fields):
     meta.setdefault("llr_bytes", 0)
     meta.pop("reserved0", None)
     meta.pop("reserved1", None)
+    # v4: decode raw imsi bytes to string
+    if "imsi" in meta and isinstance(meta["imsi"], bytes):
+        meta["imsi"] = meta["imsi"].rstrip(b"\x00").decode("ascii", errors="replace")
     return meta
 
 
@@ -151,7 +158,7 @@ class PUSCHDataset:
             raise ValueError(
                 f"Bad magic: 0x{magic:08X} (expected 0x{PUSCH_FILE_MAGIC:08X})"
             )
-        if version not in (1, 2, 3):
+        if version not in (1, 2, 3, 4):
             raise ValueError(f"Unsupported format version: {version}")
 
         self.version = version
@@ -167,11 +174,16 @@ class PUSCHDataset:
             self._capture_header_fmt = _CAP_HDR_FMT_V2
             self._meta_fields = _META_FIELDS_V2
             self._payload_fields = ("iq_bytes", "chest_bytes", "llr_bytes")
-        else:
+        elif version == 3:
             self.capture_header_bytes = CAPTURE_HEADER_BYTES_V3
             self._capture_header_fmt = _CAP_HDR_FMT_V3
             self._meta_fields = _META_FIELDS_V3
             self._payload_fields = ("iq_bytes",)
+        else:  # v4
+            self.capture_header_bytes = CAPTURE_HEADER_BYTES_V4
+            self._capture_header_fmt = _CAP_HDR_FMT_V4
+            self._meta_fields = _META_FIELDS_V4
+            self._payload_fields = ("iq_bytes", "imsi")
 
         self._offsets = []
         pos = FILE_HEADER_BYTES
@@ -248,17 +260,24 @@ class PUSCHDataset:
 
     def summary(self):
         print(repr(self))
-        print(f"{'idx':>5} {'frame':>8} {'slot':>4} {'RNTI':>6} {'mod':>4} {'PRBs':>5} {'syms':>4} {'REs':>6}")
-        print("-" * 50)
+        has_imsi = self.version >= 4
+        hdr = f"{'idx':>5} {'frame':>8} {'slot':>4} {'RNTI':>6} {'mod':>4} {'PRBs':>5} {'syms':>4} {'REs':>6}"
+        if has_imsi:
+            hdr += "  IMSI"
+        print(hdr)
+        print("-" * (50 + (18 if has_imsi else 0)))
         for i, cap in enumerate(self):
             m = cap["meta"]
             mod_names = {2: "QPSK", 4: "16Q", 6: "64Q", 8: "256Q"}
             mod = mod_names.get(m["qam_mod_order"], f"Q{m['qam_mod_order']}")
             total_re = m["num_symbols"] * m["nb_re_per_sym"]
-            print(
+            row = (
                 f"{i:5d} {m['frame']:8d} {m['slot']:4d} {m['rnti']:6d} "
                 f"{mod:>4s} {m['rb_size']:5d} {m['num_symbols']:4d} {total_re:6d}"
             )
+            if has_imsi:
+                row += f"  {m.get('imsi') or '(unlabeled)'}"
+            print(row)
 
 
 if __name__ == "__main__":

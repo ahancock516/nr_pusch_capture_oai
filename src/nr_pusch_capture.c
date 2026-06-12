@@ -27,6 +27,11 @@
 #include <string.h>
 #include <time.h>
 #include <stdatomic.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <sys/wait.h>
+#include <signal.h>
+#include <unistd.h>
 
 /* --------------------------------------------------------------------------
  * Configuration
@@ -35,6 +40,8 @@
 #define DEFAULT_MAX_CAPTURES    100
 #define CONFIG_FILE             "plugins/nr_pusch_capture/capture_config.txt"
 #define OUTPUT_FILE             "plugins/nr_pusch_capture/data/pusch_dataset.bin"
+#define LABEL_SOCKET_PATH       "/tmp/pusch_label.sock"
+#define IMSI_MAX_LEN            16
 
 /* Upper bounds for static buffers (NR maximums) */
 #define MAX_SYMBOLS_PER_SLOT    14
@@ -49,9 +56,9 @@
  * -------------------------------------------------------------------------- */
 
 #define PUSCH_FILE_MAGIC        0x50555343
-#define PUSCH_FORMAT_VERSION    3
+#define PUSCH_FORMAT_VERSION    4
 #define FILE_HEADER_BYTES       64
-#define CAPTURE_HEADER_BYTES    128
+#define CAPTURE_HEADER_BYTES    144
 #define DMRS_COMB_POWER_RATIO_THRESHOLD 1.50
 
 typedef struct __attribute__((packed)) {
@@ -96,10 +103,11 @@ typedef struct __attribute__((packed)) {
     uint32_t nvar;
     int16_t  valid_re[MAX_SYMBOLS_PER_SLOT];
     int32_t  iq_bytes;
+    char     imsi[IMSI_MAX_LEN];
 } pusch_capture_header_t;
 
 _Static_assert(sizeof(pusch_capture_header_t) == CAPTURE_HEADER_BYTES,
-               "capture header must be 128 bytes");
+               "capture header must be 144 bytes");
 
 /* --------------------------------------------------------------------------
  * Plugin state
@@ -108,7 +116,8 @@ _Static_assert(sizeof(pusch_capture_header_t) == CAPTURE_HEADER_BYTES,
 static FILE            *g_outfile;
 static pthread_mutex_t  g_lock = PTHREAD_MUTEX_INITIALIZER;
 static uint32_t         g_max_captures = DEFAULT_MAX_CAPTURES;
-static atomic_uint      g_capture_count = 0;
+static atomic_uint      g_capture_count = 0;   /* accepted (controls g_done) */
+static uint32_t         g_written_count  = 0;  /* written to disk (file header) */
 static int              g_done = 0;
 static uint64_t        *g_seen_hashes;
 static uint32_t         g_seen_hash_count = 0;
@@ -116,6 +125,235 @@ static uint32_t         g_duplicate_skip_count = 0;
 static uint32_t         g_dmrs_skip_count = 0;
 static uint32_t         g_dmrs_comb_skip_count = 0;
 static int16_t          g_iq_buf[MAX_SYMBOLS_PER_SLOT * MAX_RE_PER_SYM * 2];
+
+/* Forward declarations for helpers defined later in this file */
+static void update_capture_count(uint32_t count);
+static void label_get(uint16_t rnti, char *out);
+
+/* --------------------------------------------------------------------------
+ * Pending queue — accepted captures whose IMSI is not yet known.
+ * Flushed to disk once the label thread resolves the RNTI→IMSI mapping.
+ * All access under g_lock.
+ * -------------------------------------------------------------------------- */
+
+typedef struct {
+    uint8_t  *buf;    /* allocated record buffer; NULL = slot free */
+    size_t    size;
+    uint16_t  rnti;
+} pending_capture_t;
+
+static pending_capture_t *g_pending;   /* array of g_max_captures entries */
+static uint32_t           g_pending_len = 0;
+
+/* Write one pending capture with its IMSI filled in and update the file header. */
+static void pending_write_one(pending_capture_t *p, const char *imsi)
+{
+    pusch_capture_header_t *hdr = (pusch_capture_header_t *)p->buf;
+    memcpy(hdr->imsi, imsi, IMSI_MAX_LEN - 1);
+    hdr->imsi[IMSI_MAX_LEN - 1] = '\0';
+    fwrite(p->buf, 1, p->size, g_outfile);
+    fflush(g_outfile);
+    free(p->buf);
+    p->buf = NULL;
+    update_capture_count(++g_written_count);
+}
+
+/* Flush all pending captures for a given RNTI now that its IMSI is known.
+ * Called from the label thread — must NOT hold g_label_lock when called. */
+static void pending_flush_rnti(uint16_t rnti, const char *imsi)
+{
+    pthread_mutex_lock(&g_lock);
+    uint32_t flushed = 0;
+    for (uint32_t i = 0; i < g_pending_len; i++) {
+        if (g_pending[i].buf && g_pending[i].rnti == rnti) {
+            pending_write_one(&g_pending[i], imsi);
+            flushed++;
+        }
+    }
+    /* Compact: remove NULL slots from the front */
+    uint32_t dst = 0;
+    for (uint32_t i = 0; i < g_pending_len; i++) {
+        if (g_pending[i].buf)
+            g_pending[dst++] = g_pending[i];
+    }
+    g_pending_len = dst;
+    pthread_mutex_unlock(&g_lock);
+
+    if (flushed)
+        printf("[nr_pusch_capture] Flushed %u pending capture(s) for "
+               "RNTI 0x%04x → IMSI %s\n", flushed, rnti, imsi);
+}
+
+/* Write all remaining pending captures at shutdown (labeled or unlabeled). */
+static void pending_flush_all(void)
+{
+    for (uint32_t i = 0; i < g_pending_len; i++) {
+        if (!g_pending[i].buf)
+            continue;
+        char imsi[IMSI_MAX_LEN] = {0};
+        label_get(g_pending[i].rnti, imsi);  /* may be empty if never resolved */
+        pending_write_one(&g_pending[i], imsi);
+    }
+    g_pending_len = 0;
+}
+
+/* --------------------------------------------------------------------------
+ * RNTI → IMSI label table (updated asynchronously by label_thread)
+ * -------------------------------------------------------------------------- */
+
+static char            g_imsi_table[65536][IMSI_MAX_LEN];
+static pthread_mutex_t g_label_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_t       g_label_thread;
+static atomic_int      g_label_stop = 0;
+static pid_t           g_label_monitor_pid = -1;
+
+#define LABEL_MONITOR_SCRIPT "plugins/nr_pusch_capture/scripts/label_monitor.py"
+#define LABEL_MONITOR_LOG    "/tmp/label_monitor_pusch.log"
+
+static void start_label_monitor(void)
+{
+    if (access(LABEL_MONITOR_SCRIPT, R_OK) != 0) {
+        printf("[nr_pusch_capture] %s not found, running without auto-labeling\n",
+               LABEL_MONITOR_SCRIPT);
+        fflush(stdout);
+        return;
+    }
+
+    g_label_monitor_pid = fork();
+    if (g_label_monitor_pid == 0) {
+        /* Child: redirect output to log file */
+        FILE *lf = fopen(LABEL_MONITOR_LOG, "w");
+        if (lf) {
+            dup2(fileno(lf), STDOUT_FILENO);
+            dup2(fileno(lf), STDERR_FILENO);
+            fclose(lf);
+        }
+        execl("/usr/bin/python3", "python3", LABEL_MONITOR_SCRIPT, NULL);
+        _exit(1);
+    } else if (g_label_monitor_pid < 0) {
+        printf("[nr_pusch_capture] Warning: fork failed, "
+               "running without auto-labeling\n");
+        fflush(stdout);
+        g_label_monitor_pid = -1;
+        return;
+    }
+
+    printf("[nr_pusch_capture] Started label_monitor.py "
+           "(PID %d, log: %s)\n", g_label_monitor_pid, LABEL_MONITOR_LOG);
+    fflush(stdout);
+
+    /* Give label_monitor time to open the socket before the label thread
+     * makes its first connection attempt. */
+    usleep(500000);
+}
+
+static void stop_label_monitor(void)
+{
+    if (g_label_monitor_pid <= 0)
+        return;
+    kill(g_label_monitor_pid, SIGTERM);
+    waitpid(g_label_monitor_pid, NULL, 0);
+    printf("[nr_pusch_capture] label_monitor.py stopped\n");
+    fflush(stdout);
+    g_label_monitor_pid = -1;
+}
+
+static void label_set(uint16_t rnti, const char *imsi)
+{
+    pthread_mutex_lock(&g_label_lock);
+    memcpy(g_imsi_table[rnti], imsi, IMSI_MAX_LEN - 1);
+    g_imsi_table[rnti][IMSI_MAX_LEN - 1] = '\0';
+    pthread_mutex_unlock(&g_label_lock);
+}
+
+static void label_clear(uint16_t rnti)
+{
+    pthread_mutex_lock(&g_label_lock);
+    g_imsi_table[rnti][0] = '\0';
+    pthread_mutex_unlock(&g_label_lock);
+}
+
+static void label_get(uint16_t rnti, char *out)
+{
+    pthread_mutex_lock(&g_label_lock);
+    strncpy(out, g_imsi_table[rnti], IMSI_MAX_LEN - 1);
+    out[IMSI_MAX_LEN - 1] = '\0';
+    pthread_mutex_unlock(&g_label_lock);
+}
+
+/* Read one newline-terminated line from fd using single-byte reads — avoids
+ * stdio buffering issues on socket fds.  Returns line length, 0 on EOF, -1 on error. */
+static ssize_t read_line(int fd, char *buf, size_t maxlen)
+{
+    size_t n = 0;
+    while (n < maxlen - 1) {
+        char c;
+        ssize_t rc = read(fd, &c, 1);
+        if (rc <= 0)
+            return rc;
+        buf[n++] = c;
+        if (c == '\n')
+            break;
+    }
+    buf[n] = '\0';
+    return (ssize_t)n;
+}
+
+static void *label_thread_fn(void *arg)
+{
+    (void)arg;
+    while (!atomic_load(&g_label_stop)) {
+        int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+        if (fd < 0) { sleep(1); continue; }
+
+        struct sockaddr_un addr;
+        memset(&addr, 0, sizeof(addr));
+        addr.sun_family = AF_UNIX;
+        strncpy(addr.sun_path, LABEL_SOCKET_PATH, sizeof(addr.sun_path) - 1);
+
+        if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+            close(fd);
+            sleep(1);
+            continue;
+        }
+
+        printf("[nr_pusch_capture] Connected to label monitor at %s\n",
+               LABEL_SOCKET_PATH);
+        fflush(stdout);
+
+        char line[256];
+        while (!atomic_load(&g_label_stop) && read_line(fd, line, sizeof(line)) > 0) {
+            line[strcspn(line, "\r\n")] = '\0';
+            if (line[0] == '\0' || line[0] == 'S')
+                continue;
+
+            unsigned int rnti_val;
+            char imsi[IMSI_MAX_LEN];
+
+            if (line[0] == 'A'
+                && sscanf(line + 1, " %x %15s", &rnti_val, imsi) == 2) {
+                label_set((uint16_t)rnti_val, imsi);
+                /* g_label_lock now released — safe to acquire g_lock for flush */
+                pending_flush_rnti((uint16_t)rnti_val, imsi);
+                printf("[nr_pusch_capture] Label: RNTI 0x%04x -> IMSI %s\n",
+                       rnti_val, imsi);
+                fflush(stdout);
+            } else if (line[0] == 'R'
+                       && sscanf(line + 1, " %x", &rnti_val) == 1) {
+                label_clear((uint16_t)rnti_val);
+            }
+        }
+
+        close(fd);
+        if (!atomic_load(&g_label_stop)) {
+            printf("[nr_pusch_capture] Lost connection to label monitor, "
+                   "reconnecting...\n");
+            fflush(stdout);
+            sleep(1);
+        }
+    }
+    return NULL;
+}
 
 /* --------------------------------------------------------------------------
  * Helpers
@@ -404,6 +642,18 @@ int32_t receiver_init(void)
     fflush(stdout);
 
     pthread_mutex_init(&g_lock, NULL);
+    pthread_mutex_init(&g_label_lock, NULL);
+    memset(g_imsi_table, 0, sizeof(g_imsi_table));
+    atomic_store(&g_label_stop, 0);
+
+    g_pending = calloc(g_max_captures, sizeof(*g_pending));
+    AssertFatal(g_pending != NULL,
+                "[nr_pusch_capture] Cannot allocate pending queue\n");
+    g_pending_len   = 0;
+    g_written_count = 0;
+
+    start_label_monitor();
+    pthread_create(&g_label_thread, NULL, label_thread_fn, NULL);
 
     g_seen_hashes = calloc(g_max_captures, sizeof(*g_seen_hashes));
     AssertFatal(g_seen_hashes != NULL,
@@ -431,8 +681,23 @@ int32_t receiver_shutdown(void)
            g_dmrs_skip_count, g_dmrs_comb_skip_count, g_duplicate_skip_count);
     fflush(stdout);
 
+    atomic_store(&g_label_stop, 1);
+    pthread_join(g_label_thread, NULL);
+    pthread_mutex_destroy(&g_label_lock);
+    stop_label_monitor();
+
+    /* Flush any captures still waiting for an IMSI */
+    if (g_pending_len > 0) {
+        printf("[nr_pusch_capture] Flushing %u pending capture(s) at shutdown\n",
+               g_pending_len);
+        fflush(stdout);
+        pending_flush_all();
+    }
+    free(g_pending);
+    g_pending = NULL;
+
     if (g_outfile) {
-        update_capture_count(final_count);
+        update_capture_count(g_written_count);
         fclose(g_outfile);
         g_outfile = NULL;
     }
@@ -567,6 +832,7 @@ int receiver_compute_llr(PHY_VARS_gNB *gNB,
 
     hdr.iq_bytes = iq_off * 2 * (int32_t)sizeof(int16_t);
     hdr.record_bytes = (uint32_t)(CAPTURE_HEADER_BYTES + hdr.iq_bytes);
+    label_get(rel15_ul->rnti, hdr.imsi);
 
     size_t record_bytes = hdr.record_bytes;
     uint8_t *record_buf = malloc(record_bytes);
@@ -592,25 +858,38 @@ int receiver_compute_llr(PHY_VARS_gNB *gNB,
         return 0;
     }
 
-    fwrite(record_buf, 1, record_bytes, g_outfile);
-    fflush(g_outfile);
-    free(record_buf);
-
     remember_capture_hash(hash);
 
+    /* Accept the capture — count it regardless of whether IMSI is known yet */
     uint32_t idx = atomic_fetch_add(&g_capture_count, 1) + 1;
-    update_capture_count(idx);
+
+    if (hdr.imsi[0] != '\0') {
+        /* IMSI known — write immediately */
+        fwrite(record_buf, 1, record_bytes, g_outfile);
+        fflush(g_outfile);
+        free(record_buf);
+        update_capture_count(++g_written_count);
+    } else {
+        /* IMSI unknown — queue until label thread resolves it */
+        AssertFatal(g_pending_len < g_max_captures,
+                    "[nr_pusch_capture] Pending queue overflow\n");
+        g_pending[g_pending_len].buf  = record_buf;
+        g_pending[g_pending_len].size = record_bytes;
+        g_pending[g_pending_len].rnti = rel15_ul->rnti;
+        g_pending_len++;
+    }
 
     if (idx % 50 == 0 || idx == g_max_captures) {
-        printf("[nr_pusch_capture] Captured %u / %u accepted slots\n",
-               idx, g_max_captures);
+        printf("[nr_pusch_capture] Captured %u / %u accepted slots "
+               "(%u written, %u pending)\n",
+               idx, g_max_captures, g_written_count, g_pending_len);
         fflush(stdout);
     }
 
     if (idx >= g_max_captures) {
         g_done = 1;
-        printf("[nr_pusch_capture] Dataset complete (%u accepted captures). Plugin now passthrough.\n",
-               idx);
+        printf("[nr_pusch_capture] Dataset complete (%u accepted). "
+               "Plugin now passthrough.\n", idx);
         fflush(stdout);
     }
 

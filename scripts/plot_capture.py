@@ -51,10 +51,12 @@ def plot_capture(cap, output_path="capture_analysis.png", verbose=True):
     comb_stats = dmrs_comb_presence_stats(cap)
 
     fig, axes = plt.subplots(2, 2, figsize=(15, 10), constrained_layout=True)
+    imsi = meta.get("imsi", "")
+    imsi_str = f" | IMSI {imsi}" if imsi else ""
     fig.suptitle(
         (
             f"PUSCH Capture #{meta['capture_idx']} | Frame {meta['frame']} Slot {meta['slot']} | "
-            f"RNTI {meta['rnti']} | {mod_name} | {meta['rb_size']} PRBs"
+            f"RNTI {meta['rnti']}{imsi_str} | {mod_name} | {meta['rb_size']} PRBs"
         ),
         fontsize=14,
         fontweight="bold",
