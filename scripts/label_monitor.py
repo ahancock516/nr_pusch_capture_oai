@@ -66,6 +66,16 @@ _RE_RRC = re.compile(
     r'UE\s+\d+\s+CU UE ID\s+(\d+)\s+DU UE ID\s+\d+\s+RNTI\s+([0-9a-fA-F]+)'
 )
 
+# Service Request — two consecutive lines in [amf_n1] context
+# Phase 1: AMF assigns new ran_ue_ngap_id to existing UE
+_RE_SR_NGAP = re.compile(
+    r'\[amf_n1\].*\bamf_ue_ngap_id (\d+), ran_ue_ngap_id (\d+)\b'
+)
+# Phase 2: SUPI resolved from existing context
+_RE_SR_SUPI = re.compile(
+    r'\[amf_n1\].*Key for PDU Session context: SUPI imsi-(\d+)'
+)
+
 
 class LabelMonitor:
     def __init__(self, amf_container, stats_file, output_path, poll_interval,
@@ -103,13 +113,47 @@ class LabelMonitor:
         tag = {"info": "INFO ", "warning": "WARN ", "error": "ERROR"}[level]
         print(f"[{time.strftime('%H:%M:%S')}] [{tag}] {msg}", flush=True)
 
+    def _add_pending(self, imsi, ran_id, amf_id):
+        """Add or update an IMSI→ran_id mapping in _pending (must be called unlocked)."""
+        with self._lock:
+            # If this IMSI is already active, move it to completed so the stats
+            # poller can re-resolve its new RNTI.
+            existing_rnti = next(
+                (r for r, v in self._active.items() if v["imsi"] == imsi), None
+            )
+            if existing_rnti is not None:
+                old = self._active.pop(existing_rnti)
+                self._completed.append({
+                    **old,
+                    "rnti":          existing_rnti,
+                    "t_end_mono_ns": time.monotonic_ns(),
+                    "t_end_wall_ns": time.time_ns(),
+                    "status":        "completed",
+                })
+            # Purge stale pending entries for the same IMSI.
+            for k in [k for k, v in self._pending.items() if v["imsi"] == imsi]:
+                del self._pending[k]
+            # Warn if a different IMSI already holds this ran_id (CU UE ID recycled).
+            displaced = self._pending.get(ran_id)
+            if displaced is not None and displaced["imsi"] != imsi:
+                self._log(
+                    f"DISP  ran_id={ran_id} was pending for "
+                    f"IMSI={displaced['imsi']}, displaced by {imsi}",
+                    "warning",
+                )
+            self._pending[ran_id] = {
+                "imsi":           imsi,
+                "amf_ue_ngap_id": amf_id,
+                "t_registered_wall_ns": time.time_ns(),
+            }
+
     # ── AMF log thread ────────────────────────────────────────────────────────
 
     def _amf_thread(self):
         """
-        Tail docker AMF logs.  On each registration event, record
-        IMSI → ran_ue_ngap_id in _pending so the stats poller can
-        resolve it to a RNTI.
+        Tail docker AMF logs.  Detects both full NAS registrations and
+        Service Requests (where the UE reuses an existing context) so that
+        RNTI changes after idle-mode reconnects are captured.
         """
         while not self._stop.is_set():
             try:
@@ -120,56 +164,42 @@ class LabelMonitor:
                     text=True,
                     bufsize=1,
                 )
+                # Service Request state: set when phase-1 line is seen,
+                # consumed when phase-2 (SUPI) line is seen.
+                sr_ran_id = None
+                sr_amf_id = None
                 for line in proc.stdout:
                     if self._stop.is_set():
                         break
+
+                    # Full NAS registration
                     m = _RE_AMF.search(line)
-                    if not m:
+                    if m:
+                        imsi   = m.group(1)
+                        ran_id = int(m.group(2))
+                        amf_id = int(m.group(3))
+                        sr_ran_id = None  # registration supersedes any pending SR
+                        self._add_pending(imsi, ran_id, amf_id)
+                        self._log(f"AMF  IMSI={imsi}  ran_id={ran_id}  amf_id={amf_id}")
                         continue
-                    imsi   = m.group(1)
-                    ran_id = int(m.group(2))
-                    amf_id = int(m.group(3))
-                    with self._lock:
-                        # A re-registration from a device already in _active:
-                        # update ran_id (RNTI may have changed after handover/
-                        # restart) by moving it back to pending so the stats
-                        # poller can re-resolve the RNTI.
-                        existing_rnti = next(
-                            (r for r, v in self._active.items()
-                             if v["imsi"] == imsi), None
-                        )
-                        if existing_rnti is not None:
-                            old = self._active.pop(existing_rnti)
-                            self._completed.append({
-                                **old,
-                                "rnti":          existing_rnti,
-                                "t_end_mono_ns": time.monotonic_ns(),
-                                "t_end_wall_ns": time.time_ns(),
-                                "status":        "completed",
-                            })
-                        # Purge stale pending entries for the same IMSI
-                        # (e.g. rapid re-registrations before RNTI is resolved)
-                        for k in [k for k, v in self._pending.items()
-                                  if v["imsi"] == imsi]:
-                            del self._pending[k]
-                        # If a different IMSI already holds this ran_id in
-                        # pending (CU UE ID slot recycled by gNB), close it
-                        # as a short/incomplete session so it isn't silently lost.
-                        displaced = self._pending.get(ran_id)
-                        if displaced is not None and displaced["imsi"] != imsi:
-                            self._log(
-                                f"DISP  ran_id={ran_id} was pending for "
-                                f"IMSI={displaced['imsi']}, displaced by {imsi}",
-                                "warning",
-                            )
-                        self._pending[ran_id] = {
-                            "imsi":           imsi,
-                            "amf_ue_ngap_id": amf_id,
-                            "t_registered_wall_ns": time.time_ns(),
-                        }
-                    self._log(
-                        f"AMF  IMSI={imsi}  ran_id={ran_id}  amf_id={amf_id}"
-                    )
+
+                    # Service Request phase 1 — new ran_ue_ngap_id assigned
+                    m = _RE_SR_NGAP.search(line)
+                    if m:
+                        sr_amf_id = int(m.group(1))
+                        sr_ran_id = int(m.group(2))
+                        continue
+
+                    # Service Request phase 2 — SUPI resolved from existing context
+                    if sr_ran_id is not None:
+                        m = _RE_SR_SUPI.search(line)
+                        if m:
+                            imsi = m.group(1)
+                            ran_id, amf_id = sr_ran_id, sr_amf_id
+                            sr_ran_id = None
+                            self._add_pending(imsi, ran_id, amf_id)
+                            self._log(f"SR   IMSI={imsi}  ran_id={ran_id}  amf_id={amf_id}")
+
                 proc.wait()
             except Exception as exc:
                 self._log(f"AMF thread error: {exc}", "warning")
