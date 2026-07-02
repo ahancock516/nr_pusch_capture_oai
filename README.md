@@ -7,14 +7,15 @@ and extended with an OAI-specific labeling pipeline.
 
 ## What this fork adds
 
-| Feature | Upstream (v3) | This fork (v4) |
+| Feature | Upstream (v3) | This fork (v5) |
 |---|---|---|
-| Dataset format | v3 — IQ + DMRS metadata | v4 — adds `imsi[16]` field per capture |
+| Dataset format | v3 — IQ + DMRS metadata | v4 adds `imsi[16]`; v5 adds a per-capture DMRS channel estimate (`chest_bytes` block) |
 | IMSI labeling | post-hoc via `post_label.py` | embedded at capture time via Unix socket |
 | Label monitor | run separately | auto-started by plugin at init |
 | Pending queue | — | holds captures until IMSI known, then flushes |
-| `read_dataset.py` | v1/v2/v3 | v1/v2/v3/v4 + IMSI column in summary |
-| `plot_capture.py` | title: frame/slot/RNTI | title: + IMSI for v4 datasets |
+| Channel estimate | — | v5 — the gNB's own LS/interpolated `ul_ch_estimates`, tapped directly from the receiver (no re-derivation) |
+| `read_dataset.py` | v1/v2/v3 | v1–v5 + IMSI column in summary |
+| `plot_capture.py` | title: frame/slot/RNTI | title: + IMSI for v4+ datasets |
 
 ## How labeling works
 
@@ -44,10 +45,11 @@ so memory overhead is constant regardless of total capture count.
 
 Each accepted capture contains:
 - frequency-domain PUSCH IQ samples (per OFDM symbol, per allocated subcarrier)
+- **the gNB's own DMRS channel estimate for the same allocation** (v5) — `ul_ch_estimates`, antenna 0 / layer 0, zero-filled on non-DMRS symbols
 - slot and allocation metadata
 - DMRS configuration metadata
 - per-symbol valid RE counts
-- **IMSI of the transmitting device** (v4 datasets)
+- **IMSI of the transmitting device** (v4+ datasets)
 
 Captures are accepted only if:
 - the allocation window contains DMRS symbols
@@ -155,12 +157,12 @@ python3 scripts/post_label.py data/pusch_dataset.bin data/label_map.json \
 
 ## Dataset format
 
-### v4 (this fork) — 144-byte capture header
+### v5 (this fork) — 148-byte capture header
 
 File header (64 bytes):
 - `magic`, `version`, `max_captures`, `num_captures`
 
-Per-capture header (144 bytes):
+Per-capture header (148 bytes):
 - `record_bytes`, `capture_idx`
 - timing: `frame`, `timestamp_ns` (CLOCK_MONOTONIC)
 - slot, RNTI, modulation, layers
@@ -170,12 +172,17 @@ Per-capture header (144 bytes):
 - PHY context: `ofdm_symbol_size`, `first_carrier_offset`, `nb_re_per_sym`, `output_shift`, `nvar`
 - `valid_re[14]`
 - `iq_bytes`
-- **`imsi[16]`** ← new in v4
+- `imsi[16]` ← new in v4
+- **`chest_bytes`** ← new in v5
 
 Payload:
-- IQ only, interleaved `int16` real/imag samples
+- IQ block — interleaved `int16` real/imag samples, `iq_bytes` long
+- **ChEst block (v5+)** — the gNB's own LS/interpolated UL channel estimate (`ul_ch_estimates`),
+  antenna 0 / layer 0 (this RU is 1T1R), same `[num_symbols][nb_re_per_sym]` shape and `int16`
+  interleaved layout as the IQ block, zero-filled on OFDM symbols without a DMRS. `chest_bytes`
+  long, immediately follows the IQ block.
 
-The Python reader is backward compatible with v1/v2/v3 datasets.
+The Python reader is backward compatible with v1–v4 datasets.
 
 ### Upstream reference
 
