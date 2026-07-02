@@ -5,6 +5,8 @@ Reader for PUSCH capture datasets produced by nr_pusch_capture.
 Format support:
   - v1/v2: legacy datasets that may also include channel estimates and LLRs
   - v3:    simplified IQ-only datasets with DMRS metadata and no extra payloads
+  - v4:    v3 + IMSI label
+  - v5:    v4 + gNB's own UL channel estimate (chest), same shape as IQ
 """
 
 import struct
@@ -17,6 +19,7 @@ CAPTURE_HEADER_BYTES_V1 = 128
 CAPTURE_HEADER_BYTES_V2 = 136
 CAPTURE_HEADER_BYTES_V3 = 128
 CAPTURE_HEADER_BYTES_V4 = 144
+CAPTURE_HEADER_BYTES_V5 = 148
 CAPTURE_HEADER_BYTES = CAPTURE_HEADER_BYTES_V3
 PUSCH_FILE_MAGIC = 0x50555343
 MAX_SYMBOLS_PER_SLOT = 14
@@ -89,6 +92,9 @@ _META_FIELDS_V3 = list(_META_FIELDS_V2)
 _CAP_HDR_FMT_V4 = _CAP_HDR_FMT_V3 + "16s"
 _META_FIELDS_V4 = list(_META_FIELDS_V3)
 
+_CAP_HDR_FMT_V5 = _CAP_HDR_FMT_V4 + "i"
+_META_FIELDS_V5 = list(_META_FIELDS_V4)
+
 
 def _parse_capture_header(buf, fmt, field_names, payload_fields):
     vals = struct.unpack(fmt, buf)
@@ -158,7 +164,7 @@ class PUSCHDataset:
             raise ValueError(
                 f"Bad magic: 0x{magic:08X} (expected 0x{PUSCH_FILE_MAGIC:08X})"
             )
-        if version not in (1, 2, 3, 4):
+        if version not in (1, 2, 3, 4, 5):
             raise ValueError(f"Unsupported format version: {version}")
 
         self.version = version
@@ -179,11 +185,16 @@ class PUSCHDataset:
             self._capture_header_fmt = _CAP_HDR_FMT_V3
             self._meta_fields = _META_FIELDS_V3
             self._payload_fields = ("iq_bytes",)
-        else:  # v4
+        elif version == 4:
             self.capture_header_bytes = CAPTURE_HEADER_BYTES_V4
             self._capture_header_fmt = _CAP_HDR_FMT_V4
             self._meta_fields = _META_FIELDS_V4
             self._payload_fields = ("iq_bytes", "imsi")
+        else:  # v5
+            self.capture_header_bytes = CAPTURE_HEADER_BYTES_V5
+            self._capture_header_fmt = _CAP_HDR_FMT_V5
+            self._meta_fields = _META_FIELDS_V5
+            self._payload_fields = ("iq_bytes", "imsi", "chest_bytes")
 
         self._offsets = []
         pos = FILE_HEADER_BYTES
@@ -291,7 +302,7 @@ if __name__ == "__main__":
         cap = ds[0]
         print("\nFirst capture details:")
         print(f"  IQ shape:       {cap['iq'].shape}")
-        print(f"  Legacy ChEst:   {cap['chest'].shape}")
+        print(f"  ChEst shape:    {cap['chest'].shape}  (v1-4: legacy/unused, v5+: gNB UL estimate)")
         print(f"  Legacy LLRs:    {len(cap['llr'])}")
         if cap['iq'].size:
             print(f"  IQ range:       [{cap['iq'].real.min():.0f}, {cap['iq'].real.max():.0f}]")

@@ -1,8 +1,10 @@
 /*
- * PUSCH IQ Dataset Capture Plugin for Sionna Research Kit
+ * PUSCH IQ + Channel-Estimate Dataset Capture Plugin for Sionna Research Kit
  *
- * Hooks into the OAI receiver plugin interface to capture raw PUSCH IQ:
+ * Hooks into the OAI receiver plugin interface to capture, per accepted slot:
  *   - Frequency-domain IQ samples (per OFDM symbol, per allocated subcarrier)
+ *   - gNB's own UL channel estimate for the same REs (v5+; antenna 0 / layer
+ *     0 only, zero-filled on non-DMRS symbols — see pusch_capture_header_t)
  *   - Slot metadata needed to evaluate DMRS symbol placement and comb layout
  *
  * The plugin collects exactly N accepted slot captures (configured via config
@@ -10,7 +12,8 @@
  * A capture is accepted only when the allocation window contains DMRS symbols,
  * the active PUSCH configuration exposes a strongly visible DMRS RE comb and
  * that comb is detected in the received IQ, and the resulting IQ payload is
- * not a duplicate of a previously accepted capture.
+ * not a duplicate of a previously accepted capture. Duplicate detection is
+ * based on the raw IQ payload only, not the derived channel estimate.
  *
  * Enable with:  --loader.receiver.shlibversion _pusch_capture
  */
@@ -56,9 +59,9 @@
  * -------------------------------------------------------------------------- */
 
 #define PUSCH_FILE_MAGIC        0x50555343
-#define PUSCH_FORMAT_VERSION    4
+#define PUSCH_FORMAT_VERSION    5
 #define FILE_HEADER_BYTES       64
-#define CAPTURE_HEADER_BYTES    144
+#define CAPTURE_HEADER_BYTES    148
 #define DMRS_COMB_POWER_RATIO_THRESHOLD 1.50
 
 typedef struct __attribute__((packed)) {
@@ -104,10 +107,17 @@ typedef struct __attribute__((packed)) {
     int16_t  valid_re[MAX_SYMBOLS_PER_SLOT];
     int32_t  iq_bytes;
     char     imsi[IMSI_MAX_LEN];
+    /* v5: gNB's own LS/interpolated UL channel estimate (ul_ch_estimates),
+     * antenna 0 / layer 0 only (matches the existing rxFs[0] IQ capture —
+     * this gNB RU is 1T1R). Same [num_symbols][nb_re_per_sym] shape as the
+     * IQ block; zero-filled on OFDM symbols without a DMRS (the estimate is
+     * only ever computed at DMRS symbol positions, never interpolated
+     * across the whole capture window). */
+    int32_t  chest_bytes;
 } pusch_capture_header_t;
 
 _Static_assert(sizeof(pusch_capture_header_t) == CAPTURE_HEADER_BYTES,
-               "capture header must be 144 bytes");
+               "capture header must be 148 bytes");
 
 /* --------------------------------------------------------------------------
  * Plugin state
@@ -125,6 +135,7 @@ static uint32_t         g_duplicate_skip_count = 0;
 static uint32_t         g_dmrs_skip_count = 0;
 static uint32_t         g_dmrs_comb_skip_count = 0;
 static int16_t          g_iq_buf[MAX_SYMBOLS_PER_SLOT * MAX_RE_PER_SYM * 2];
+static int16_t          g_chest_buf[MAX_SYMBOLS_PER_SLOT * MAX_RE_PER_SYM * 2];
 
 /* Forward declarations for helpers defined later in this file */
 static void update_capture_count(uint32_t count);
@@ -831,7 +842,30 @@ int receiver_compute_llr(PHY_VARS_gNB *gNB,
     }
 
     hdr.iq_bytes = iq_off * 2 * (int32_t)sizeof(int16_t);
-    hdr.record_bytes = (uint32_t)(CAPTURE_HEADER_BYTES + hdr.iq_bytes);
+
+    /* gNB's own channel estimate for the same REs, antenna 0 / layer 0.
+     * ul_chs[0] is the already-computed LS/interpolated estimate (see
+     * nr_pusch_antenna_processing() in nr_ul_channel_estimation.c) — a
+     * dense, 0-based array of nb_re_per_sym values per OFDM symbol,
+     * starting at offset (ofdm_symbol_size * symbol). No wraparound needed
+     * here (unlike the raw IQ read above), and only DMRS symbols are
+     * populated — zero elsewhere, matching the underlying OAI buffer. */
+    memset(g_chest_buf, 0, (size_t)num_symbols * nb_re_per_sym * 2 * sizeof(int16_t));
+    c16_t *ul_ch0 = ul_chs[0];
+    for (int s = 0; s < num_symbols; s++) {
+        int symbol = start_symbol + s;
+        if (((hdr.ul_dmrs_symb_pos >> symbol) & 0x01) == 0)
+            continue;   /* no DMRS on this symbol — leave zero-filled */
+
+        c16_t *ch = ul_ch0 + (size_t)symbol * frame_parms->ofdm_symbol_size;
+        for (int re = 0; re < nb_re_per_sym; re++) {
+            g_chest_buf[(s * nb_re_per_sym + re) * 2 + 0] = ch[re].r;
+            g_chest_buf[(s * nb_re_per_sym + re) * 2 + 1] = ch[re].i;
+        }
+    }
+    hdr.chest_bytes = num_symbols * nb_re_per_sym * 2 * (int32_t)sizeof(int16_t);
+
+    hdr.record_bytes = (uint32_t)(CAPTURE_HEADER_BYTES + hdr.iq_bytes + hdr.chest_bytes);
     label_get(rel15_ul->rnti, hdr.imsi);
 
     size_t record_bytes = hdr.record_bytes;
@@ -842,6 +876,7 @@ int receiver_compute_llr(PHY_VARS_gNB *gNB,
 
     memcpy(record_buf, &hdr, CAPTURE_HEADER_BYTES);
     memcpy(record_buf + CAPTURE_HEADER_BYTES, g_iq_buf, hdr.iq_bytes);
+    memcpy(record_buf + CAPTURE_HEADER_BYTES + hdr.iq_bytes, g_chest_buf, hdr.chest_bytes);
 
     uint64_t hash = compute_capture_identity_hash(
         &hdr,
