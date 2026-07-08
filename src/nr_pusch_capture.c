@@ -932,8 +932,9 @@ int receiver_compute_llr(PHY_VARS_gNB *gNB,
 
     if (idx >= g_max_captures) {
         g_done = 1;
-        printf("[nr_pusch_capture] Dataset complete (%u accepted). "
-               "Plugin now passthrough.\n", idx);
+        pending_flush_all();
+        printf("[nr_pusch_capture] Dataset complete (%u accepted, %u written). "
+               "Plugin now passthrough.\n", idx, g_written_count);
         fflush(stdout);
     }
 
