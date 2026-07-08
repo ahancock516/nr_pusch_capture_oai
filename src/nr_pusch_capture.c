@@ -277,12 +277,6 @@ static void label_set(uint16_t rnti, const char *imsi)
     pthread_mutex_unlock(&g_label_lock);
 }
 
-static void label_clear(uint16_t rnti)
-{
-    pthread_mutex_lock(&g_label_lock);
-    g_imsi_table[rnti][0] = '\0';
-    pthread_mutex_unlock(&g_label_lock);
-}
 
 static void label_get(uint16_t rnti, char *out)
 {
@@ -351,7 +345,14 @@ static void *label_thread_fn(void *arg)
                 fflush(stdout);
             } else if (line[0] == 'R'
                        && sscanf(line + 1, " %x", &rnti_val) == 1) {
-                label_clear((uint16_t)rnti_val);
+                /* NAS session ended but the MAC RNTI may still be active.
+                 * Flush any pending captures using the current label, then
+                 * keep the label alive so subsequent captures for this RNTI
+                 * are written rather than silently accumulated as unlabeled. */
+                char cur_imsi[IMSI_MAX_LEN];
+                label_get((uint16_t)rnti_val, cur_imsi);
+                if (cur_imsi[0] != '\0')
+                    pending_flush_rnti((uint16_t)rnti_val, cur_imsi);
             }
         }
 
