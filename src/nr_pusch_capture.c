@@ -531,7 +531,11 @@ static int build_dmrs_quiet_bins(const pusch_capture_header_t *hdr,
         }
     }
 
-    return active_count > 0 && quiet_count > 0;
+    /* quiet_count==0 is valid when num_dmrs_cdm_grps_no_data==1 (single CDM
+     * group, all reserved subcarriers carry active DMRS — e.g. SISO PUSCH).
+     * In that case the comb power check is skipped; we still require at least
+     * one active DMRS bin to flag a valid layout. */
+    return active_count > 0;
 }
 
 static int has_expected_dmrs_comb(const pusch_capture_header_t *hdr,
@@ -567,10 +571,14 @@ static int has_expected_dmrs_comb(const pusch_capture_header_t *hdr,
         }
     }
 
-    if (active_sample_count == 0 || quiet_sample_count == 0)
+    if (active_sample_count == 0)
         return 0;
 
     double active_mean = active_power_sum / (double)active_sample_count;
+
+    if (quiet_sample_count == 0)
+        return active_mean > 0.0;
+
     double quiet_mean = quiet_power_sum / (double)quiet_sample_count;
     if (quiet_mean <= 0.0)
         return active_mean > 0.0;
