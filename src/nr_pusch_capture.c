@@ -126,6 +126,7 @@ _Static_assert(sizeof(pusch_capture_header_t) == CAPTURE_HEADER_BYTES,
 static FILE            *g_outfile;
 static pthread_mutex_t  g_lock = PTHREAD_MUTEX_INITIALIZER;
 static uint32_t         g_max_captures = DEFAULT_MAX_CAPTURES;
+static int              g_strict_dmrs_comb = 0; /* 1 = Jose's strict filter (quiet_count>0 required) */
 static atomic_uint      g_capture_count = 0;   /* accepted (controls g_done) */
 static uint32_t         g_written_count  = 0;  /* written to disk (file header) */
 static int              g_done = 0;
@@ -376,9 +377,24 @@ static uint32_t read_max_captures(const char *path)
     FILE *f = fopen(path, "r");
     if (!f)
         return DEFAULT_MAX_CAPTURES;
+
     uint32_t n = 0;
     if (fscanf(f, "%u", &n) != 1 || n == 0)
         n = DEFAULT_MAX_CAPTURES;
+
+    /* Optional subsequent lines: key=value pairs.
+     * Recognised keys:
+     *   strict_dmrs_comb=1   — require quiet DMRS bins (Jose's original filter).
+     *                          Accepts only Msg3/SRB PUSCH with 2 CDM groups
+     *                          reserved, which is typical during initial UE
+     *                          registration. Skips regular SISO data PUSCH. */
+    char line[128];
+    while (fgets(line, sizeof(line), f)) {
+        unsigned int val = 0;
+        if (sscanf(line, " strict_dmrs_comb = %u", &val) == 1)
+            g_strict_dmrs_comb = (val != 0) ? 1 : 0;
+    }
+
     fclose(f);
     return n;
 }
@@ -532,10 +548,19 @@ static int build_dmrs_quiet_bins(const pusch_capture_header_t *hdr,
         }
     }
 
-    /* quiet_count==0 is valid when num_dmrs_cdm_grps_no_data==1 (single CDM
-     * group, all reserved subcarriers carry active DMRS — e.g. SISO PUSCH).
-     * In that case the comb power check is skipped; we still require at least
-     * one active DMRS bin to flag a valid layout. */
+    /* Strict mode (Jose's filter): require at least one quiet reference bin so
+     * the power-ratio check has a reference.  This admits only allocations with
+     * num_dmrs_cdm_grps_no_data==2, which is typical for Msg3 and early SRB
+     * PUSCH during initial UE registration.  Regular SISO data PUSCH (CDM
+     * group 0 only, quiet_count==0) is rejected here and counted as a comb
+     * skip — use strict_dmrs_comb=1 in capture_config.txt together with a UE
+     * attachment cycle to collect registration-phase captures.
+     *
+     * Relaxed mode (dgx-spark default): quiet_count==0 is valid for SISO PUSCH
+     * where all reserved subcarriers carry active DMRS (no quiet reference).
+     * The power-ratio check falls back to active_mean>0 in has_expected_dmrs_comb. */
+    if (g_strict_dmrs_comb)
+        return active_count > 0 && quiet_count > 0;
     return active_count > 0;
 }
 
@@ -658,6 +683,10 @@ int32_t receiver_init(void)
 
     printf("[nr_pusch_capture] Initializing - will capture %u accepted slots\n",
            g_max_captures);
+    printf("[nr_pusch_capture] DMRS filter: %s\n",
+           g_strict_dmrs_comb
+               ? "STRICT (Jose's filter) — Msg3/SRB registration PUSCH only"
+               : "relaxed — all SISO PUSCH accepted");
     printf("[nr_pusch_capture] Output: %s\n", OUTPUT_FILE);
     fflush(stdout);
 
@@ -679,6 +708,11 @@ int32_t receiver_init(void)
     AssertFatal(g_seen_hashes != NULL,
                 "[nr_pusch_capture] Cannot allocate duplicate filter state\n");
 
+    /* Unlink any existing file before creating — fopen("wb") on a file owned
+     * by another uid fails without CAP_DAC_OVERRIDE (dropped in docker-compose).
+     * The directory is world-writable so unlink succeeds regardless of file
+     * ownership, and fopen then creates a fresh file owned by this process. */
+    unlink(OUTPUT_FILE);
     g_outfile = fopen(OUTPUT_FILE, "wb");
     AssertFatal(g_outfile != NULL,
                 "[nr_pusch_capture] Cannot open %s for writing\n", OUTPUT_FILE);
@@ -697,8 +731,12 @@ int32_t receiver_shutdown(void)
     uint32_t final_count = atomic_load(&g_capture_count);
     printf("[nr_pusch_capture] Shutting down - captured %u / %u accepted slots\n",
            final_count, g_max_captures);
-    printf("[nr_pusch_capture] Skipped %u captures without DMRS symbols, %u without a strongly visible DMRS comb, and %u duplicate captures\n",
-           g_dmrs_skip_count, g_dmrs_comb_skip_count, g_duplicate_skip_count);
+    printf("[nr_pusch_capture] Skipped %u captures without DMRS symbols, "
+           "%u without a %s DMRS comb, and %u duplicate captures\n",
+           g_dmrs_skip_count,
+           g_dmrs_comb_skip_count,
+           g_strict_dmrs_comb ? "quiet-bin (strict)" : "strongly visible",
+           g_duplicate_skip_count);
     fflush(stdout);
 
     atomic_store(&g_label_stop, 1);
