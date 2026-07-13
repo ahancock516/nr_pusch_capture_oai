@@ -196,6 +196,35 @@ static void pending_flush_rnti(uint16_t rnti, const char *imsi)
                "RNTI 0x%04x → IMSI %s\n", flushed, rnti, imsi);
 }
 
+/* Discard all pending captures for a confirmed-dead RNTI (RA never reached
+ * RRC_CONNECTED, so it will never receive a label). Called from the label
+ * thread — must NOT hold g_label_lock when called. */
+static void pending_discard_rnti(uint16_t rnti)
+{
+    pthread_mutex_lock(&g_lock);
+    uint32_t discarded = 0;
+    for (uint32_t i = 0; i < g_pending_len; i++) {
+        if (g_pending[i].buf && g_pending[i].rnti == rnti) {
+            free(g_pending[i].buf);
+            g_pending[i].buf = NULL;
+            discarded++;
+        }
+    }
+    /* Compact: remove NULL slots from the front */
+    uint32_t dst = 0;
+    for (uint32_t i = 0; i < g_pending_len; i++) {
+        if (g_pending[i].buf)
+            g_pending[dst++] = g_pending[i];
+    }
+    g_pending_len = dst;
+    pthread_mutex_unlock(&g_lock);
+
+    if (discarded)
+        printf("[nr_pusch_capture] Discarded %u pending capture(s) for "
+               "RNTI 0x%04x (confirmed ghost, RA never completed)\n",
+               discarded, rnti);
+}
+
 /* Write all remaining pending captures at shutdown (labeled or unlabeled). */
 static void pending_flush_all(void)
 {
@@ -354,6 +383,12 @@ static void *label_thread_fn(void *arg)
                 label_get((uint16_t)rnti_val, cur_imsi);
                 if (cur_imsi[0] != '\0')
                     pending_flush_rnti((uint16_t)rnti_val, cur_imsi);
+            } else if (line[0] == 'D'
+                       && sscanf(line + 1, " %x", &rnti_val) == 1) {
+                /* Confirmed ghost — RA never reached RRC_CONNECTED, so this
+                 * RNTI will never receive a label. Discard rather than let
+                 * it sit in the pending queue until the final flush. */
+                pending_discard_rnti((uint16_t)rnti_val);
             }
         }
 

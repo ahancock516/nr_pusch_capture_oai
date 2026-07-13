@@ -1,1 +1,19 @@
+# Dataset binaries
 data/
+
+# Compiled plugin artifacts
+*.so
+*.so.*
+*.o
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Backup directories created during experiments
+scripts/backup/
+scripts/backup_pre_ghost_discard/
+
+# Logs
+/tmp/label_monitor_pusch.log

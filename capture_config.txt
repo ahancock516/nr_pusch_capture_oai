@@ -1,2 +1,2 @@
-500
-# strict_dmrs_comb=1
+5000
+strict_dmrs_comb=1

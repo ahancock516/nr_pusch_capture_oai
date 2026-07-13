@@ -44,7 +44,8 @@ from pathlib import Path
 # ── defaults ──────────────────────────────────────────────────────────────────
 
 DEFAULT_AMF_CONTAINER = "oai-amf"
-DEFAULT_STATS_FILE = "/home/user/openairinterface5g/nrRRC_stats.log"
+DEFAULT_GNB_CONTAINER = "oai-gnb"
+DEFAULT_STATS_FILE = "/opt/oai-gnb/nrRRC_stats.log"
 DEFAULT_OUTPUT = str(
     Path(__file__).parent.parent / "data" / "label_map.json"
 )
@@ -76,11 +77,23 @@ _RE_SR_SUPI = re.compile(
     r'\[amf_n1\].*Key for PDU Session context: SUPI imsi-(\d+)'
 )
 
+# gNB MAC-layer RA failure signatures — a UE that never reached RRC_CONNECTED,
+# so it will never appear in the AMF log or nrRRC_stats.log. These RNTIs are
+# confirmed dead ("ghosts": false PRACH detections or genuinely failed
+# attaches) and their pending PUSCH captures can never be labeled.
+_RE_RA_FAIL = [
+    re.compile(r'UE (?:0x)?([0-9a-fA-F]+) RA failed at state WAIT_Msg3'),
+    re.compile(r'RA Contention Resolution timer expired for UE (?:0x)?([0-9a-fA-F]+)'),
+    re.compile(r'No UE found with C-RNTI ([0-9a-fA-F]+), ignoring Msg3'),
+    re.compile(r'TC-RNTI ([0-9a-fA-F]+): exceeded RA window, cannot schedule Msg2'),
+]
+
 
 class LabelMonitor:
-    def __init__(self, amf_container, stats_file, output_path, poll_interval,
-                 socket_path):
+    def __init__(self, amf_container, gnb_container, stats_file, output_path,
+                 poll_interval, socket_path):
         self.amf_container = amf_container
+        self.gnb_container = gnb_container
         self.stats_file    = Path(stats_file)
         self.output_path   = Path(output_path)
         self.poll_interval = poll_interval
@@ -106,6 +119,12 @@ class LabelMonitor:
 
         # list of closed session dicts
         self._completed: list = []
+
+        # rnti (int) -> True, RNTIs confirmed dead via gNB MAC RA-failure logs.
+        # Used to dedupe "D" discard broadcasts and to avoid ever promoting
+        # a confirmed-dead RNTI to active/pending.
+        self._dead_rntis: dict = {}
+        self._ghosts_discarded = 0
 
     # ── helpers ───────────────────────────────────────────────────────────────
 
@@ -205,6 +224,60 @@ class LabelMonitor:
                 self._log(f"AMF thread error: {exc}", "warning")
             if not self._stop.is_set():
                 time.sleep(2)   # back-off before reconnecting
+
+    # ── gNB MAC RA-failure thread ─────────────────────────────────────────────
+
+    def _gnb_thread(self):
+        """
+        Tail the gNB's own container log for RA-failure signatures. These
+        RNTIs never reach RRC_CONNECTED, so they'll never show up in the AMF
+        log or nrRRC_stats.log — they're permanently un-labelable. Broadcast
+        a "D <rnti_hex>" message so the plugin can discard their pending
+        captures immediately instead of writing them unlabeled at shutdown.
+        """
+        while not self._stop.is_set():
+            try:
+                proc = subprocess.Popen(
+                    ["docker", "logs", "-f", "--tail", "0", self.gnb_container],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    bufsize=1,
+                )
+                for line in proc.stdout:
+                    if self._stop.is_set():
+                        break
+
+                    for pattern in _RE_RA_FAIL:
+                        m = pattern.search(line)
+                        if not m:
+                            continue
+                        try:
+                            rnti = int(m.group(1), 16)
+                        except ValueError:
+                            continue
+                        self._mark_dead(rnti)
+                        break
+
+                proc.wait()
+            except Exception as exc:
+                self._log(f"gNB RA-fail thread error: {exc}", "warning")
+            if not self._stop.is_set():
+                time.sleep(2)   # back-off before reconnecting
+
+    def _mark_dead(self, rnti: int):
+        """Record a confirmed-dead RNTI and broadcast a discard to connected plugins."""
+        with self._lock:
+            if rnti in self._dead_rntis:
+                return
+            self._dead_rntis[rnti] = True
+            # A dead RNTI can never be a real session — drop any stray active
+            # entry that might exist for it (defensive; _active is keyed by
+            # RNTI, unlike _pending which is keyed by ran_ue_ngap_id).
+            self._active.pop(rnti, None)
+            self._ghosts_discarded += 1
+        self._log(f"GHOST RNTI=0x{rnti:04x}  confirmed dead (RA never completed)")
+        self._broadcast(f"D {rnti:04x}\n")
 
     # ── RRC stats poll thread ─────────────────────────────────────────────────
 
@@ -411,6 +484,7 @@ class LabelMonitor:
 
     def run(self):
         self._log(f"AMF container : {self.amf_container}")
+        self._log(f"gNB container : {self.gnb_container}")
         self._log(f"RRC stats file: {self.stats_file}")
         self._log(f"Output        : {self.output_path}")
         self._log(f"Poll interval : {self.poll_interval}s")
@@ -419,6 +493,7 @@ class LabelMonitor:
 
         for name, target in [
             ("amf",    self._amf_thread),
+            ("gnb",    self._gnb_thread),
             ("stats",  self._stats_thread),
             ("write",  self._write_thread),
             ("socket", self._socket_server_thread),
@@ -432,7 +507,8 @@ class LabelMonitor:
                     self._log(
                         f"State  pending={len(self._pending)}  "
                         f"active={len(self._active)}  "
-                        f"completed={len(self._completed)}"
+                        f"completed={len(self._completed)}  "
+                        f"ghosts_discarded={self._ghosts_discarded}"
                     )
         except KeyboardInterrupt:
             self._log("Stopping — writing final label map…")
@@ -450,6 +526,11 @@ def main():
     ap.add_argument(
         "--amf-container", default=DEFAULT_AMF_CONTAINER,
         help=f"Docker container name for the AMF (default: {DEFAULT_AMF_CONTAINER})"
+    )
+    ap.add_argument(
+        "--gnb-container", default=DEFAULT_GNB_CONTAINER,
+        help=f"Docker container name for the gNB, tailed for RA-failure "
+             f"signatures (default: {DEFAULT_GNB_CONTAINER})"
     )
     ap.add_argument(
         "--stats-file", default=DEFAULT_STATS_FILE,
@@ -471,6 +552,7 @@ def main():
 
     LabelMonitor(
         amf_container  = args.amf_container,
+        gnb_container  = args.gnb_container,
         stats_file     = args.stats_file,
         output_path    = args.output,
         poll_interval  = args.poll_interval,
